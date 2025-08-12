@@ -1,31 +1,26 @@
-/**
- * Count all Gmail threads safely in batches before the crawl starts.
- * Stores the total in the "Crawler Status" sheet for progress calculations.
- */
-function countAllGmailThreadsFast() {
-  const BATCH_SIZE = 500;                                                // Max allowed by GmailApp
-  let totalThreads = 0;                                                  // Counter for all threads
-  let startIndex = 0;                                                     // Start position in search
-  let batch;                                                              // Placeholder for fetched threads
-  
-  console.log("Starting Gmail thread count...");                          // Debug log
-  
-  while (true) {                                                          // Loop until no more threads
-    batch = GmailApp.search('', startIndex, BATCH_SIZE);                  // Fetch next batch of threads
-    totalThreads += batch.length;                                         // Add to counter
-    startIndex += BATCH_SIZE;                                             // Move to next set
-    
-    if (batch.length < BATCH_SIZE) {                                      // If last batch is smaller, stop
-      break;
-    }
+// --------------------------- countAllGmailThreadsFast --------------------------- //
+function countAllGmailThreadsFast() {                                                              // count all Gmail threads quickly in batches
+  const BATCH_SIZE = 500;                                                                          // max threads GmailApp can fetch at once
+  let totalThreads = 0;                                                                            // total threads counter
+  let startIndex = 0;                                                                              // starting index for search pagination
+  let batch;                                                                                       // placeholder for fetched batch
+
+  console.log("count start");                                                                      // log start of count
+
+  while (true) {                                                                                   // loop until no more threads
+    batch = GmailApp.search('', startIndex, BATCH_SIZE);                                           // fetch next batch of threads
+    totalThreads += batch.length;                                                                  // add to total counter
+    startIndex += BATCH_SIZE;                                                                      // move to next batch index
+    if (batch.length < BATCH_SIZE) break;                                                          // if batch smaller than max, stop
   }
-  
-  console.log(`Total Gmail threads found: ${totalThreads}`);              // Log total count
-  
-  // Save to "Crawler Status" sheet for later percentage calculations
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();             
-  const statusSheet = spreadsheet.getSheetByName("Crawler Status");      
-  statusSheet.getRange("B11").setValue(totalThreads);                      // Assuming B11 is "Total Threads Found"
-  
-  return totalThreads;                                                    // Return total for immediate use
-}
+
+  console.log(`threads total: ${totalThreads}`);                                                   // log total found
+
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();                                      // get active spreadsheet
+  const statusSheet = spreadsheet.getSheetByName("Crawler Status");                               // open crawler status sheet
+  statusSheet.insertRowBefore(5);                                                                  // insert a new row before row 5
+  statusSheet.getRange("A5").setValue("Total Gmail Threads");                                      // label the row
+  statusSheet.getRange("B5").setValue(totalThreads);                                               // write the total threads count
+
+  return totalThreads;                                                                             // return total for caller
+}                                                                                                  // end countAllGmailThreadsFast
