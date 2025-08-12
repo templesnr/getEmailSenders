@@ -64,70 +64,115 @@ function initializeCrawlerState() {                                             
 }                                                                                                         // End initializeCrawlerState
 
 // --------------------------- runCrawlerSession --------------------------- //
-function runCrawlerSession() {                                                                     // main crawler loop to process Gmail threads
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();                                      // get active spreadsheet
-  const progressSheet = spreadsheet.getSheetByName("Crawler Progress");                           // open progress sheet
-  let [pageTokenRaw, threadsProcessedRaw, currentBatchJSONRaw, batchPositionRaw] =
-    progressSheet.getRange("A2:D2").getValues()[0];                                                // read saved state row
-  const pageToken = pageTokenRaw == null ? "" : String(pageTokenRaw);                              // normalize pageToken
-  let threadsProcessed = parseInt(threadsProcessedRaw, 10) || 0;                                   // parse threads processed
-  let currentBatchJSON = currentBatchJSONRaw || "";                                                // normalize stored batch JSON
-  let batchPosition = parseInt(batchPositionRaw, 10) || 0;                                         // parse batch position
-  const startTime = Date.now();                                                                    // record start time of session
-  let sessionThreads = 0;                                                                          // counter for session threads
+function runCrawlerSession() {                                                                // main session runner
+  const state = loadCrawlerProgress();                                                        // load saved progress from sheet
+  let pageToken = state.pageToken;                                                            // page token to use (string or "")
+  let threadsProcessed = state.threadsProcessed;                                              // number of threads processed so far
+  let currentBatch = state.currentBatch;                                                      // array of minimal thread objects
+  let batchPosition = state.batchPosition;                                                    // index inside currentBatch
 
-  if (pageToken === "START") {                                                                     // if fresh start
-    console.log("fresh");                                                                          // log fresh start
-    threadsProcessed = 0;                                                                          // reset count
-    currentBatchJSON = "";                                                                         // clear batch
-    batchPosition = 0;                                                                             // reset position
-    saveProgress("", 0, [], 0);                                                                    // save reset state
-    const totalThreads = countAllGmailThreadsFast();                                               // get total threads once
-    updateCrawlerStatus('RUNNING', `Total threads: ${totalThreads}`);                              // update status
-  } else {
-    console.log("resume");                                                                         // log resume
-  }
+  const sessionStart = Date.now();                                                            // session start timestamp
+  let sessionCount = 0;                                                                       // counter for threads processed this session
 
-  let threads = currentBatchJSON ? JSON.parse(currentBatchJSON) : [];                              // load batch from state
-  if (threads.length === 0) {                                                                      // if batch empty
-    const searchResults = GmailApp.search('', 0, 100);                                             // fetch next 100 threads
-    threads = searchResults.map(thread => thread.getId());                                         // store thread IDs
-    batchPosition = 0;                                                                             // reset position
-  }
+  if (pageToken === 'START') {                                                                // if marker indicates fresh start
+    pageToken = '';                                                                            // clear token for first fetch
+    threadsProcessed = 0;                                                                      // reset counters
+    currentBatch = [];                                                                         // clear any stored batch
+    batchPosition = 0;                                                                         // reset position
+    saveProgress(pageToken, threadsProcessed, currentBatch, batchPosition);                   // persist reset state
+  }                                                                                           // end fresh-start handling
 
-  while (batchPosition < threads.length) {                                                         // loop through batch
-    const threadId = threads[batchPosition];                                                       // get thread ID
-    const thread = GmailApp.getThreadById(threadId);                                               // fetch thread
-    processThreadForCrawler(thread);                                                               // process thread data
-    batchPosition++;                                                                               // move to next thread
-    threadsProcessed++;                                                                            // increment total count
-    sessionThreads++;                                                                              // increment session count
-    if (timeLimitReached(startTime)) break;                                                        // stop if time limit hit
-  }
+  console.log('resume');                                                                      // short resume log
 
-  saveProgress(pageToken, threadsProcessed, threads.slice(batchPosition), batchPosition);          // save state
+  try {                                                                                       // wrap processing in try so we can save on error
+    let keepLooping = true;                                                                   // control variable indicating we may continue
 
-  const statusSheet = spreadsheet.getSheetByName("Crawler Status");                                // open status sheet
-  const totalThreads = statusSheet.getRange("B5").getValue();                                      // read total threads
-  const progressPercent = totalThreads > 0
-    ? Math.min((threadsProcessed / totalThreads) * 100, 100).toFixed(1)                            // calc %
-    : 0;                                                                                           // default 0
-  statusSheet.getRange("B10").setValue(`${progressPercent}%`);                                     // update progress %
-  console.log(`progress: ${progressPercent}%`);                                                    // log progress %
+    while (keepLooping && !timeLimitReached(sessionStart)) {                                  // process until time nearly up
+      let threadsBatch = [];                                                                  // will hold the current batch to iterate
 
-  scheduleNextCrawlerRun(2 * 60 * 1000);                                                           // schedule next run in 2 mins
-}                                                                                                  // end runCrawlerSession
+      if (Array.isArray(currentBatch) && currentBatch.length > 0 && batchPosition < currentBatch.length) { // if we have saved batch left
+        threadsBatch = currentBatch;                                                          // reuse saved batch
+      } else {                                                                                // otherwise fetch new batch from Gmail
+        const listOptions = { maxResults: 50 };                                               // request 50 threads per batch
+        if (pageToken && pageToken !== '') listOptions.pageToken = pageToken;                 // include pageToken if present
+        let response = null;                                                                  // response placeholder
+        try {
+          response = Gmail.Users.Threads.list('me', listOptions);                             // call Gmail API (advanced service)
+        } catch (apiErr) {
+          console.error('apiErr');                                                            // short error log
+          saveProgress(pageToken, threadsProcessed, currentBatch, batchPosition);             // save state before exit
+          scheduleNextCrawlerRun(5 * 60 * 1000);                                              // schedule retry in 5 minutes
+          return;                                                                             // abort session
+        }                                                                                     // end catch
+
+        const threads = (response && response.threads) ? response.threads : [];               // normalize threads list
+        const nextToken = (response && response.nextPageToken) ? response.nextPageToken : ''; // next page token or empty
+
+        if (threads.length === 0 && !nextToken) {                                            // nothing left to process
+          saveSendersToSheet(collectSendersMap());                                            // save final senders (helper below)
+          updateCrawlerProgress(threadsProcessed, getTotalEmailsCount(), getUniqueSendersCount()); // update final counters
+          completeCrawlerAnalysis();                                                          // finalize and clear triggers
+          return;                                                                             // finished
+        }                                                                                     // end if no data
+
+        // build minimal batch objects to persist and use (avoid storing full Gmail objects)
+        threadsBatch = threads.map(t => ({ id: t.id, historyId: t.historyId || '', snippet: t.snippet || '' })); // minimal thread info
+        currentBatch = threadsBatch;                                                           // set current batch
+        batchPosition = 0;                                                                     // start at beginning
+        pageToken = nextToken;                                                                 // store token for next fetch after this batch
+        saveProgress(pageToken, threadsProcessed, currentBatch, batchPosition);                // persist new batch & token
+      }                                                                                       // end else fetch
+
+      if (batchPosition < threadsBatch.length) {                                              // ensure valid position
+        const threadStub = threadsBatch[batchPosition];                                       // minimal thread record
+        try {
+          // process thread details and update in-memory senders map
+          const keeperEmails = getKeeperEmails();                                             // fetch keeper list
+          const sendersMap = loadSendersMapFromSheet();                                       // load senders map helper
+          const res = processThreadForCrawler({ id: threadStub.id }, keeperEmails, sendersMap); // process thread (populates sendersMap)
+          persistSendersMapToSheet(sendersMap);                                               // persist senders immediately
+          if (res && res.emailsFound) updateCrawlerProgress(threadsProcessed + 1, res.emailsFound, sendersMap.size); // quick update
+        } catch (procErr) {
+          console.warn('procErr');                                                            // short warn
+        }                                                                                     // end catch for processing
+        batchPosition++;                                                                       // advance in batch
+        threadsProcessed++;                                                                    // advance processed count
+        sessionCount++;                                                                        // advance session count
+      } else {                                                                                // unexpected state guard
+        currentBatch = [];                                                                     // clear batch
+        batchPosition = 0;                                                                     // reset position
+      }                                                                                       // end else guard
+
+      // short periodic save to reduce lost work
+      if (sessionCount > 0 && sessionCount % 25 === 0) {                                      // every 25 threads
+        saveProgress(pageToken, threadsProcessed, currentBatch, batchPosition);               // persist progress
+        updateCrawlerProgress(threadsProcessed, getTotalEmailsCount(), getUniqueSendersCount()); // update dashboard
+      }                                                                                       // end periodic block
+    }                                                                                         // end while loop
+
+    // session ended due to time limit (not completion)
+    saveProgress(pageToken, threadsProcessed, currentBatch, batchPosition);                   // save state for resume
+    updateCrawlerProgress(threadsProcessed, getTotalEmailsCount(), getUniqueSendersCount());  // update dashboard
+    scheduleNextCrawlerRun();                                                                 // schedule next session
+    console.log('saved');                                                                     // short saved log
+  } catch (err) {                                                                              // unexpected top-level error
+    console.error('fatal');                                                                   // short fatal log
+    saveProgress(pageToken, threadsProcessed, currentBatch, batchPosition);                   // save regardless
+    scheduleNextCrawlerRun(5 * 60 * 1000);                                                    // retry in 5 minutes
+  }                                                                                             // end try/catch
+}                                                                                               // end runCrawlerSession
+
 // --------------------------- saveProgress --------------------------- //
-function saveProgress(pageToken, threadsProcessed, currentBatch, batchPosition) {                  // write progress to sheet (A2:D2)
-  const ss = SpreadsheetApp.getActiveSpreadsheet();                                                // get spreadsheet
-  const ps = ss.getSheetByName('Crawler Progress');                                                // open progress sheet
+function saveProgress(pageToken, threadsProcessed, currentBatch, batchPosition) {                 // write progress to sheet (A2:D2)
+  const ss = SpreadsheetApp.getActiveSpreadsheet();                                              // get spreadsheet
+  const ps = ss.getSheetByName('Crawler Progress');                                             // open progress sheet
   const json = (Array.isArray(currentBatch) && currentBatch.length) ? JSON.stringify(currentBatch) : ''; // serialize minimal batch
-  ps.getRange('A2').setValue(pageToken || '');                                                     // column A = pageToken
-  ps.getRange('B2').setValue(threadsProcessed || 0);                                               // column B = threadsProcessed
-  ps.getRange('C2').setValue(json);                                                                // column C = currentBatch JSON
-  ps.getRange('D2').setValue(batchPosition || 0);                                                  // column D = batchPosition
-  console.log('progress saved');                                                                   // short log
-}                                                                                                  // end saveProgress
+  ps.getRange('A2').setValue(pageToken || '');                                                   // column A = pageToken
+  ps.getRange('B2').setValue(threadsProcessed || 0);                                            // column B = threadsProcessed
+  ps.getRange('C2').setValue(json);                                                              // column C = currentBatch JSON
+  ps.getRange('D2').setValue(batchPosition || 0);                                                // column D = batchPosition
+  console.log('progress saved');                                                                 // short log
+}                                                                                               // end saveProgress
 
 // --------------------------- loadCrawlerProgress --------------------------- //
 function loadCrawlerProgress() {                                                                 // read progress from sheet and return normalized object
