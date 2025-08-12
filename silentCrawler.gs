@@ -340,20 +340,27 @@ function updateCrawlerProgress(threadsProcessed, emailsFound, sendersCount) {   
 }                                                                                               // end updateCrawlerProgress
 
 // --------------------------- updateCrawlerStatus --------------------------- //
-function updateCrawlerStatus(status, message) {                                                  // write status & message to sheet & props
-  try {                                                                                          // try update
-    const ss = SpreadsheetApp.getActiveSpreadsheet();                                            // get spreadsheet
-    const s = ss.getSheetByName('Crawler Status');                                               // open status
-    if (s) {                                                                                     // if sheet exists
-      s.getRange('B2').setValue(status);                                                         // set Status cell
-      s.getRange('B4').setValue(new Date());                                                     // set Last Update
-      s.getRange('B8').setValue(message || '');                                                  // set Current Phase
-    }                                                                                            // end if
-    PropertiesService.getScriptProperties().setProperty('crawlerStatus', status || '');          // persist to script properties
-  } catch (e) {                                                                                  // on error
-    console.warn('status err');                                                                  // warn
-  }                                                                                              // end try/catch
-}                                                                                               // end updateCrawlerStatus
+function updateCrawlerStatus(status, phase) {                                                              // Update crawler status sheet with given status and phase
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();                                               // Get active spreadsheet
+  const statusSheet = spreadsheet.getSheetByName("Crawler Status");                                         // Get the Crawler Status sheet
+  const now = new Date();                                                                                   // Current date/time
+  
+  statusSheet.getRange("B2").setValue(status);                                                              // Set status (e.g., RUNNING, SCHEDULED, etc.)
+  statusSheet.getRange("B3").setValue(statusSheet.getRange("B3").getValue() || now);                        // Set start time if not already set
+  statusSheet.getRange("B4").setValue(now);                                                                 // Update last update time
+  statusSheet.getRange("B11").setValue(phase);                                                              // Set current phase
+  
+  const totalThreads = statusSheet.getRange("B5").getValue() || 0;                                          // Read total threads from Gmail
+  const processedThreads = statusSheet.getRange("B7").getValue() || 0;                                      // Read total threads processed
+  let progressPercent = 0;                                                                                  // Default progress
+  
+  if (totalThreads > 0) {                                                                                   // If we have a valid total
+    progressPercent = Math.min(100, ((processedThreads / totalThreads) * 100).toFixed(1));                  // Calculate percentage, cap at 100%
+  }                                                                                                         // End if
+  
+  statusSheet.getRange("B10").setValue(`${progressPercent}%`);                                              // Write percentage to B10
+  console.log(`status: ${status}, progress: ${progressPercent}%`);                                          // Debug log
+}                                                                                                           // End updateCrawlerStatus
 
 // --------------------------- scheduleNextCrawlerRun --------------------------- //
 function scheduleNextCrawlerRun(delayMs = 3 * 60 * 1000) {                                       // schedule next run with optional delay
