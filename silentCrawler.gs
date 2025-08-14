@@ -5,7 +5,7 @@
  * until the entire Gmail account has been processed. Tracks senders, name variations,
  * totals, progress %, trigger count, and preserves progress across runs.
  *
- * Version 14: Merged Crawler Progress into the Crawler Status sheet for consolidation.
+ * Version 14.1: Corrected range error during sheet preparation.
  */
 
 // --------------------------- Globals --------------------------- //
@@ -350,22 +350,23 @@ function prepareCrawlerSheets(fresh = false) {                              // F
   let statusSheet = ss.getSheetByName('Crawler Status');                    // Get the sheet named "Crawler Status".
   if (!statusSheet) statusSheet = ss.insertSheet('Crawler Status');         // If the sheet doesn't exist, create it.
   statusSheet.clear();                                                      // Clear all content from the status sheet.
-  statusSheet.getRange('A1:B15').setValues([                                // Set up the layout and labels for the status dashboard.
-    ['Crawler Status', ''],                                                 // Title for the status dashboard.
-    ['Status', ''],                                                         // Label for the current status (e.g., RUNNING, STOPPED).
-    ['Started', ''],                                                        // Label for the timestamp when the crawl started.
-    ['Last Update', ''],                                                    // Label for the timestamp of the last activity.
-    ['Trigger Count', ''],                                                  // Label for the number of active triggers.
-    ['Total Threads Found', ''],                                            // Label for the total number of email threads found in the inbox.
-    ['Total Threads Processed', 0],                                         // Label for the number of threads processed so far.
-    ['Estimated Progress', '=IF(B6=0, 0, B7/B6)'],                          // Use a formula for automatic progress calculation.
-    ['Total Emails Found', 0],                                              // Label for the total number of individual emails found.
-    ['Unique Senders Found', 0],                                            // Label for the number of unique senders found.
-    ['Current Phase', ''],                                                  // Label for a descriptive message about the current operation.
-    [],                                                                     // Spacer row.
-    ['--- Progress State ---', ''],                                         // Sub-header for progress state.
-    ['Page Token', 'START'],                                                // Label and initial value for the page token.
-    ['Batch JSON', ''], ['Batch Pos', 0]                                    // Labels and initial values for batch data.
+  statusSheet.getRange('A1:B16').setValues([                                // Set up the layout and labels for the status dashboard.
+    ['Crawler Status', ''],                                                 // 1
+    ['Status', ''],                                                         // 2
+    ['Started', ''],                                                        // 3
+    ['Last Update', ''],                                                    // 4
+    ['Trigger Count', ''],                                                  // 5
+    ['Total Threads Found', ''],                                            // 6
+    ['Total Threads Processed', 0],                                         // 7
+    ['Estimated Progress', '=IF(B6=0, 0, B7/B6)'],                          // 8
+    ['Total Emails Found', 0],                                              // 9
+    ['Unique Senders Found', 0],                                            // 10
+    ['Current Phase', ''],                                                  // 11
+    [],                                                                     // 12 (Spacer row)
+    ['--- Progress State ---', ''],                                         // 13 (Sub-header)
+    ['Page Token', 'START'],                                                // 14
+    ['Batch JSON', ''],                                                     // 15
+    ['Batch Pos', 0]                                                        // 16
   ]);                                                                       // End of status sheet values.
   statusSheet.getRange('B8').setNumberFormat('0.00%');                      // Format the formula cell as a percentage.
   statusSheet.getRange('A1:A').setFontWeight('bold');                       // Make the first column of the status sheet bold for readability.
