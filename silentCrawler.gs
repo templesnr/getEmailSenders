@@ -1,415 +1,678 @@
 /**
- * SILENT GMAIL CRAWLER - Self-Triggering Background Analysis
- * Runs in short sessions, saves progress to sheets, and reschedules itself until done.
+ * SILENT GMAIL CRAWLER - Master Script
+ * ------------------------------------
+ * Runs in repeated short sessions, saving state to sheets and rescheduling itself
+ * until the entire Gmail account has been processed. Tracks senders, name variations,
+ * totals, progress %, trigger count, and preserves progress across runs.
+ *
+ * Version 12.2: Restored missing global constant.
  */
 
 // --------------------------- Globals --------------------------- //
-let CRAWLER_RUN_MS = 4.5 * 60 * 1000;              // allowed run time per session (ms)  // global run-time constant
+const CRAWLER_RUN_MS = 4.5 * 60 * 1000;                                      // Define the maximum runtime for a single session (4.5 minutes in milliseconds).
 
-// --------------------------- startSilentCrawler --------------------------- //
-function startSilentCrawler() {                                                              // public starter for the crawler
-  clearCrawlerTriggers();                                                                    // remove any existing triggers
-  initializeCrawlerState(true);                                                              // initialize sheets & props for fresh start
-  runCrawlerSession();                                                                       // execute first session immediately
-}                                                                                            // end startSilentCrawler
+// --------------------------- UI & Menu Functions --------------------------- //
+/**
+ * @summary Adds a custom menu to the spreadsheet UI when the file is opened.
+ * @description This function runs automatically when the spreadsheet is opened and creates
+ * the "Email Management" menu with options to start, stop, and check the crawler.
+ */
+function onOpen() {                                                         // Function that runs automatically on spreadsheet open.
+  const ui = SpreadsheetApp.getUi();                                        // Get the UI object to interact with the spreadsheet's interface.
+  ui.createMenu('Email Management')                                         // Create a new top-level menu named "Email Management".
+    .addItem('🤖 Start Silent Crawler (Fresh Start)', 'startSilentCrawlerFresh') // Add a menu item to start a fresh crawl.
+    .addItem('▶ Resume Silent Crawler', 'startSilentCrawlerResume')         // Add a menu item to resume a crawl.
+    .addItem('⏹️ Stop Silent Crawler', 'stopSilentCrawler')                  // Add a menu item to manually stop the crawler.
+    .addItem('📊 Check Crawler Status', 'checkCrawlerStatus')                // Add a menu item to log the current status.
+    .addToUi();                                                             // Add the created menu to the spreadsheet's UI.
+}                                                                           // End of onOpen function.
 
-// --------------------------- stopSilentCrawler --------------------------- //
-function stopSilentCrawler() {                                                               // public stop for the crawler
-  clearCrawlerTriggers();                                                                    // delete scheduled triggers
-  updateCrawlerStatus('STOPPED', 'Stopped by user');                                        // mark status stopped
-}                                                                                            // end stopSilentCrawler
+/**
+ * @summary Menu helper function to start the crawler with a fresh start.
+ */
+function startSilentCrawlerFresh() {                                        // Function definition for the "Fresh Start" menu item.
+  startSilentCrawler(true);                                                 // Call the main start function, passing 'true' to signal a fresh start.
+}                                                                           // End of startSilentCrawlerFresh function.
 
-// --------------------------- initializeCrawlerState --------------------------- //
-function initializeCrawlerState() {                                                                     // Initialize or reset crawler progress & status sheets
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();                                            // Get active spreadsheet
+/**
+ * @summary Menu helper function to resume the crawler.
+ */
+function startSilentCrawlerResume() {                                       // Function definition for the "Resume" menu item.
+  startSilentCrawler(false);                                                // Call the main start function, passing 'false' to signal a resume.
+}                                                                           // End of startSilentCrawlerResume function.
+
+
+// --------------------------- Main Controller Functions --------------------------- //
+/**
+ * @summary Main entry point to start or resume the crawler.
+ * @description This function orchestrates the start of the process, whether it's a
+ * fresh start or a resume. It clears old triggers and prepares the sheets.
+ * @param {boolean} fresh - If true, starts a fresh crawl. If false, resumes.
+ */
+function startSilentCrawler(fresh) {                                        // Function definition for the main start process.
+  console.info(`Starting silent crawler. Fresh start: ${fresh}`);          // Log whether this is a fresh start or a resume.
+  clearCrawlerTriggers();                                                   // Clear any existing triggers to ensure a clean run.
+  prepareCrawlerSheets(fresh);                                              // Prepare the spreadsheet, passing the 'fresh' flag.
+}                                                                           // End of startSilentCrawler function.
+
+/**
+ * @summary Stops crawler operation by clearing triggers and updating status.
+ */
+function stopSilentCrawler() {                                              // Function definition to manually stop the crawl.
+  clearCrawlerTriggers();                                                   // Call the function to remove any scheduled triggers.
+  updateCrawlerStatus('STOPPED', 'Stopped by user');                        // Update the status display to show that the process was stopped.
+  console.info('Silent crawler stopped');                                   // Log a confirmation message that the crawler has been stopped.
+}                                                                           // End of stopSilentCrawler function.
+
+/**
+ * @summary Counts total Gmail threads and then starts the first crawler session.
+ */
+function countThreadsAndStart() {                                           // Function definition to count threads and start the main process.
+  console.info('Counting Gmail threads...');                                // Log that the thread counting is starting.
+  const totalThreads = countAllGmailThreadsFast();                          // Call the fast counting function and store the result.
+  updateCrawlerStatus('INITIALIZED', 'Thread count complete');              // Update the status to show that counting is complete.
+  console.info('Thread count complete:', totalThreads);                     // Log the final count of total threads.
+  runCrawlerSession();                                                      // Call the main processing function to start the crawl.
+}                                                                           // End of countThreadsAndStart function.
+
+/**
+ * @summary Executes a single crawling session, acting as the main controller.
+ * @description This function coordinates the entire process for a single 4.5-minute run.
+ * It calls sheet service functions to load state, API service functions to fetch data,
+ * core logic functions to process data, and trigger functions to schedule the next run.
+ */
+function runCrawlerSession() {                                              // Function definition for a single processing session.
+  const sessionStart = Date.now();                                          // Record the start time of the session.
+  console.info('Starting crawler session');                                 // Log that a new session is beginning.
+
+  // --- Initialization ---
+  const { pageToken: loadedToken, threadsProcessed: loadedThreads, currentBatch: loadedBatch, batchPosition: loadedPos } = loadCrawlerProgress(); // Load the saved progress from the sheet.
+  let pageToken = (loadedToken === 'START') ? '' : (loadedToken || '');     // Set the page token, handling the special 'START' case.
+  let threadsProcessed = (loadedToken === 'START') ? 0 : (loadedThreads || 0); // Set the count of processed threads, resetting if it's a 'START'.
+  let currentBatch = Array.isArray(loadedBatch) ? loadedBatch : [];         // Ensure the current batch is a valid array.
+  let batchPosition = (loadedToken === 'START') ? 0 : (loadedPos || 0);     // Set the position within the batch, resetting if it's a 'START'.
+
+  let sendersMap = loadSendersMapFromSheet();                               // Load the map of senders from the "Senders" sheet.
+  let nameVarMap = loadNameVariationsMapFromSheet();                        // Load the map of name variations from its sheet.
   
-  // --- Progress sheet setup ---
-  let progressSheet = spreadsheet.getSheetByName("Crawler Progress");                                    // Try to get existing "Crawler Progress" sheet
-  if (!progressSheet) {                                                                                  // If it doesn't exist
-    progressSheet = spreadsheet.insertSheet("Crawler Progress");                                         // Create it
-  }                                                                                                      // End if
-  progressSheet.clear();                                                                                 // Clear any existing content
-  progressSheet.getRange("A1:D1").setValues([["Page Token", "Threads Processed", "Current Batch", "Batch Position"]]); // Set headers
-  progressSheet.getRange("A2:D2").setValues([["START", 0, "", 0]]);                                      // Initialize with start values
+  if (loadedToken === 'START') {                                            // If the loaded token is 'START'...
+    saveProgress('', 0, [], 0);                                             // ...persist a clean state to the sheet.
+    console.info('Fresh START detected — clearing in-memory maps and starting from first page.'); // ...log that a fresh start is happening.
+    sendersMap.clear();                                                     // ...clear the in-memory senders map to prevent double counting.
+    nameVarMap.clear();                                                     // ...clear the in-memory name variations map.
+  }                                                                         // End of if block.
+
+  console.info('Resuming from processed:', threadsProcessed, 'pageToken:', pageToken || '<none>'); // Log the point from which the session is resuming.
+
+  try {                                                                     // Start a try block to catch any unexpected errors.
+    let processedThisSession = 0;                                           // Initialize a counter for threads processed in this session only.
+    let morePages = true;                                                   // A flag to indicate if there are more pages of threads to fetch.
+
+    while (!timeLimitReached(sessionStart) && morePages) {                  // Loop as long as the time limit has not been reached and there are more pages.
+      let batchToIterate = [];                                              // Initialize an array to hold the batch of threads to be processed.
+
+      if (Array.isArray(currentBatch) && currentBatch.length > 0 && batchPosition < currentBatch.length) { // If there's an unfinished batch from a previous run...
+        batchToIterate = currentBatch;                                      // ...use that batch.
+      } else {                                                              // Otherwise...
+        const response = fetchThreadBatch(pageToken);                       // ...call the API service to fetch a new batch.
+        if (!response) {                                                    // If the fetch failed...
+          scheduleNextCrawlerRun();                                         // ...schedule a retry and exit.
+          return;                                                           // ...stop this session.
+        }                                                                   // End of if block.
+
+        const threads = response.threads || [];                             // Get the threads from the response, or an empty array if none.
+        const nextToken = response.nextToken || '';                         // Get the next page token, or an empty string if none.
+
+        if (!nextToken) {                                                   // If there is no next token from the API...
+          morePages = false;                                                // ...this is the last page, so set the flag to stop the main loop after this batch.
+          console.info('Last page of threads received. The script will finalize after this batch.'); // Log this event.
+        }                                                                   // End of if block.
+
+        if (threads.length === 0) {                                         // If the API returns an empty batch of threads...
+          console.info('No more threads to process — finalizing now.');     // ...log that the process is complete.
+          completeCrawlerAnalysis();                                        // ...run the final completion function.
+          return;                                                           // ...and exit immediately.
+        }                                                                   // End of if block.
+
+        currentBatch = threads.map(t => ({ id: t.id, snippet: t.snippet || '', historyId: t.historyId || '' })); // Create a compact representation of the batch.
+        batchPosition = 0;                                                  // Reset the position within the new batch to the beginning.
+        pageToken = nextToken;                                              // Store the next page token for the next fetch.
+        saveProgress(pageToken, threadsProcessed, currentBatch, batchPosition); // Save the new batch and token information.
+        batchToIterate = currentBatch;                                      // Set the new batch as the one to be iterated over.
+        console.info('Fetched', batchToIterate.length, 'threads; nextPageToken exists?', !!pageToken); // Log the results of the fetch.
+      }                                                                     // End of else block.
+
+      // Process one thread from the batch
+      if (batchPosition < batchToIterate.length) {                          // If the current position is valid within the batch...
+        const stub = batchToIterate[batchPosition];                         // ...get the thread information at the current position.
+        const threadDetails = fetchThreadDetails(stub.id);                  // ...call the API service to get the full thread details.
+        if (threadDetails) {                                                // If the details were fetched successfully...
+          processThreadForCrawler(threadDetails, sendersMap, nameVarMap);   // ...call the core logic function to process the data.
+        }                                                                   // End of if block.
+        batchPosition++;                                                    // ...increment the position within the batch.
+        threadsProcessed++;                                                 // ...increment the total number of threads processed.
+        processedThisSession++;                                             // ...increment the number of threads processed in this session.
+      } else {                                                              // If the position is out of range...
+        console.warn('Batch position out of range — resetting batch');      // ...log a warning.
+        currentBatch = [];                                                  // ...reset the batch.
+        batchPosition = 0;                                                  // ...reset the position.
+      }                                                                     // End of else block.
+
+      // Periodic persist + dashboard updates
+      if (processedThisSession > 0 && processedThisSession % 100 === 0) {   // Every 100 threads processed in this session...
+        saveProgress(pageToken, threadsProcessed, currentBatch, batchPosition); // ...save the current progress.
+        persistSendersMapToSheet(sendersMap);                               // ...save the senders map to the sheet.
+        persistNameVariationsMapToSheet(nameVarMap);                        // ...save the name variations map to the sheet.
+        updateCrawlerProgress(threadsProcessed, getTotalEmailsCount(), getUniqueSendersCount()); // ...update the dashboard counters.
+        updateTriggerCountInStatus();                                       // ...update the trigger count on the dashboard.
+        console.info('BATCH PROGRESS: processed', threadsProcessed, '(session', processedThisSession, ')'); // ...log a progress update.
+      }                                                                     // End of if block.
+    }                                                                       // End of while loop.
+
+    // --- Session End Logic ---
+    saveProgress(pageToken, threadsProcessed, currentBatch, batchPosition); // Save the final state for this run.
+    persistSendersMapToSheet(sendersMap);                                   // Persist the senders map.
+    persistNameVariationsMapToSheet(nameVarMap);                            // Persist the name variations map.
+    updateCrawlerProgress(threadsProcessed, getTotalEmailsCount(), getUniqueSendersCount()); // Update the dashboard counters.
+    updateTriggerCountInStatus();                                           // Update the trigger count.
+
+    if (morePages) {                                                        // If the `morePages` flag is still true, we stopped due to time.
+      scheduleNextCrawlerRun();                                             // Schedule the next session to continue the work.
+      console.info('Session paused — processed so far =', threadsProcessed);// Log that the session has paused.
+    } else {                                                                // If `morePages` is false, the last batch was processed.
+      console.info('Final batch processed. Completing analysis.');          // Log that we are finalizing.
+      completeCrawlerAnalysis();                                            // Run the completion routine.
+    }                                                                       // End of if/else block.
+
+  } catch (err) {                                                           // If an unexpected error occurs in the main block...
+    console.error('Unexpected error in runCrawlerSession:', err, err.stack); // ...log the full error with its stack trace.
+    saveProgress(pageToken, threadsProcessed, currentBatch, batchPosition); // ...attempt to save the current progress.
+    scheduleNextCrawlerRun(5 * 60 * 1000);                                  // ...schedule a retry after a 5-minute delay.
+  }                                                                         // End of try-catch block.
+}                                                                           // End of runCrawlerSession function.
+
+/**
+ * @summary Finalizes the crawler run.
+ * @description This function is called when the entire inbox has been processed. It ensures
+ * all data is saved, moves keepers from the Senders list, updates the status to "COMPLETE",
+ * and clears any remaining triggers to stop the process.
+ */
+function completeCrawlerAnalysis() {                                            // Function definition for completing the analysis.
+  console.info('Completing crawler analysis');                                  // Log that the process is complete.
+  persistSendersMapToSheet(loadSendersMapFromSheet());                          // Do a final save of the senders map.
+  persistNameVariationsMapToSheet(loadNameVariationsMapFromSheet());            // Do a final save of the name variations map.
   
-  // --- Status sheet setup ---
-  let statusSheet = spreadsheet.getSheetByName("Crawler Status");                                        // Try to get existing "Crawler Status" sheet
-  if (!statusSheet) {                                                                                    // If it doesn't exist
-    statusSheet = spreadsheet.insertSheet("Crawler Status");                                             // Create it
-  }                                                                                                      // End if
-  statusSheet.clear();                                                                                   // Clear any existing content
-  statusSheet.getRange("A1:B1").setValues([["Crawler Status", ""]]);                                     // Sheet title
-  statusSheet.getRange("A2:B12").setValues([                                                             // Fill layout rows
-    ["Status", ""],                                                                                      // Row 2
-    ["Started", ""],                                                                                     // Row 3
-    ["Last Update", ""],                                                                                 // Row 4
-    ["Total Threads in Gmail", ""],                                                                      // Row 5
-    ["Triggers Active", ""],                                                                             // Row 6
-    ["Total Threads Processed", ""],                                                                     // Row 7
-    ["Total Emails Found", ""],                                                                          // Row 8
-    ["Unique Senders Found", ""],                                                                        // Row 9
-    ["Estimated Progress", ""],                                                                          // Row 10
-    ["Current Phase", ""],                                                                               // Row 11
-    ["Next Run", ""]                                                                                     // Row 12
-  ]);                                                                                                    // End setValues
-  
-  // --- Initial counts ---
-  const totalThreads = countAllGmailThreadsFast();                                                       // Get total Gmail threads
-  statusSheet.getRange("B5").setValue(totalThreads);                                                      // Save total threads
-  const triggerCount = countActiveCrawlerTriggers();                                                     // Get active crawler triggers
-  statusSheet.getRange("B6").setValue(triggerCount);                                                      // Save trigger count
-  
-  updateCrawlerStatus("INITIALIZED", "Crawler state initialized for fresh start.");                       // Set initial status
-  console.log("init");                                                                                    // Debug log
-}                                                                                                         // End initializeCrawlerState
+  moveKeepersToEnd();                                                           // Move specified senders to the keepers sheet.
 
-// --------------------------- runCrawlerSession --------------------------- //
-function runCrawlerSession() {                                                                // main session runner
-  const state = loadCrawlerProgress();                                                        // load saved progress from sheet
-  let pageToken = state.pageToken;                                                            // page token to use (string or "")
-  let threadsProcessed = state.threadsProcessed;                                              // number of threads processed so far
-  let currentBatch = state.currentBatch;                                                      // array of minimal thread objects
-  let batchPosition = state.batchPosition;                                                    // index inside currentBatch
-
-  const sessionStart = Date.now();                                                            // session start timestamp
-  let sessionCount = 0;                                                                       // counter for threads processed this session
-
-  if (pageToken === 'START') {                                                                // if marker indicates fresh start
-    pageToken = '';                                                                            // clear token for first fetch
-    threadsProcessed = 0;                                                                      // reset counters
-    currentBatch = [];                                                                         // clear any stored batch
-    batchPosition = 0;                                                                         // reset position
-    saveProgress(pageToken, threadsProcessed, currentBatch, batchPosition);                   // persist reset state
-  }                                                                                           // end fresh-start handling
-
-  console.log('resume');                                                                      // short resume log
-
-  try {                                                                                       // wrap processing in try so we can save on error
-    let keepLooping = true;                                                                   // control variable indicating we may continue
-
-    while (keepLooping && !timeLimitReached(sessionStart)) {                                  // process until time nearly up
-      let threadsBatch = [];                                                                  // will hold the current batch to iterate
-
-      if (Array.isArray(currentBatch) && currentBatch.length > 0 && batchPosition < currentBatch.length) { // if we have saved batch left
-        threadsBatch = currentBatch;                                                          // reuse saved batch
-      } else {                                                                                // otherwise fetch new batch from Gmail
-        const listOptions = { maxResults: 50 };                                               // request 50 threads per batch
-        if (pageToken && pageToken !== '') listOptions.pageToken = pageToken;                 // include pageToken if present
-        let response = null;                                                                  // response placeholder
-        try {
-          response = Gmail.Users.Threads.list('me', listOptions);                             // call Gmail API (advanced service)
-        } catch (apiErr) {
-          console.error('apiErr');                                                            // short error log
-          saveProgress(pageToken, threadsProcessed, currentBatch, batchPosition);             // save state before exit
-          scheduleNextCrawlerRun(5 * 60 * 1000);                                              // schedule retry in 5 minutes
-          return;                                                                             // abort session
-        }                                                                                     // end catch
-
-        const threads = (response && response.threads) ? response.threads : [];               // normalize threads list
-        const nextToken = (response && response.nextPageToken) ? response.nextPageToken : ''; // next page token or empty
-
-        if (threads.length === 0 && !nextToken) {                                            // nothing left to process
-          saveSendersToSheet(collectSendersMap());                                            // save final senders (helper below)
-          updateCrawlerProgress(threadsProcessed, getTotalEmailsCount(), getUniqueSendersCount()); // update final counters
-          completeCrawlerAnalysis();                                                          // finalize and clear triggers
-          return;                                                                             // finished
-        }                                                                                     // end if no data
-
-        // build minimal batch objects to persist and use (avoid storing full Gmail objects)
-        threadsBatch = threads.map(t => ({ id: t.id, historyId: t.historyId || '', snippet: t.snippet || '' })); // minimal thread info
-        currentBatch = threadsBatch;                                                           // set current batch
-        batchPosition = 0;                                                                     // start at beginning
-        pageToken = nextToken;                                                                 // store token for next fetch after this batch
-        saveProgress(pageToken, threadsProcessed, currentBatch, batchPosition);                // persist new batch & token
-      }                                                                                       // end else fetch
-
-      if (batchPosition < threadsBatch.length) {                                              // ensure valid position
-        const threadStub = threadsBatch[batchPosition];                                       // minimal thread record
-        try {
-          // process thread details and update in-memory senders map
-          const keeperEmails = getKeeperEmails();                                             // fetch keeper list
-          const sendersMap = loadSendersMapFromSheet();                                       // load senders map helper
-          const res = processThreadForCrawler({ id: threadStub.id }, keeperEmails, sendersMap); // process thread (populates sendersMap)
-          persistSendersMapToSheet(sendersMap);                                               // persist senders immediately
-          if (res && res.emailsFound) updateCrawlerProgress(threadsProcessed + 1, res.emailsFound, sendersMap.size); // quick update
-        } catch (procErr) {
-          console.warn('procErr');                                                            // short warn
-        }                                                                                     // end catch for processing
-        batchPosition++;                                                                       // advance in batch
-        threadsProcessed++;                                                                    // advance processed count
-        sessionCount++;                                                                        // advance session count
-      } else {                                                                                // unexpected state guard
-        currentBatch = [];                                                                     // clear batch
-        batchPosition = 0;                                                                     // reset position
-      }                                                                                       // end else guard
-
-      // short periodic save to reduce lost work
-      if (sessionCount > 0 && sessionCount % 25 === 0) {                                      // every 25 threads
-        saveProgress(pageToken, threadsProcessed, currentBatch, batchPosition);               // persist progress
-        updateCrawlerProgress(threadsProcessed, getTotalEmailsCount(), getUniqueSendersCount()); // update dashboard
-      }                                                                                       // end periodic block
-    }                                                                                         // end while loop
-
-    // session ended due to time limit (not completion)
-    saveProgress(pageToken, threadsProcessed, currentBatch, batchPosition);                   // save state for resume
-    updateCrawlerProgress(threadsProcessed, getTotalEmailsCount(), getUniqueSendersCount());  // update dashboard
-    scheduleNextCrawlerRun();                                                                 // schedule next session
-    console.log('saved');                                                                     // short saved log
-  } catch (err) {                                                                              // unexpected top-level error
-    console.error('fatal');                                                                   // short fatal log
-    saveProgress(pageToken, threadsProcessed, currentBatch, batchPosition);                   // save regardless
-    scheduleNextCrawlerRun(5 * 60 * 1000);                                                    // retry in 5 minutes
-  }                                                                                             // end try/catch
-}                                                                                               // end runCrawlerSession
-
-// --------------------------- saveProgress --------------------------- //
-function saveProgress(pageToken, threadsProcessed, currentBatch, batchPosition) {                 // write progress to sheet (A2:D2)
-  const ss = SpreadsheetApp.getActiveSpreadsheet();                                              // get spreadsheet
-  const ps = ss.getSheetByName('Crawler Progress');                                             // open progress sheet
-  const json = (Array.isArray(currentBatch) && currentBatch.length) ? JSON.stringify(currentBatch) : ''; // serialize minimal batch
-  ps.getRange('A2').setValue(pageToken || '');                                                   // column A = pageToken
-  ps.getRange('B2').setValue(threadsProcessed || 0);                                            // column B = threadsProcessed
-  ps.getRange('C2').setValue(json);                                                              // column C = currentBatch JSON
-  ps.getRange('D2').setValue(batchPosition || 0);                                                // column D = batchPosition
-  console.log('progress saved');                                                                 // short log
-}                                                                                               // end saveProgress
-
-// --------------------------- loadCrawlerProgress --------------------------- //
-function loadCrawlerProgress() {                                                                 // read progress from sheet and return normalized object
-  const ss = SpreadsheetApp.getActiveSpreadsheet();                                              // get spreadsheet
-  const ps = ss.getSheetByName('Crawler Progress');                                             // open progress sheet
-  const row = ps.getRange('A2:D2').getValues()[0];                                               // read A2:D2
-  const pageTokenRaw = row[0];                                                                   // raw token value
-  const threadsProcessedRaw = row[1];                                                            // raw threads processed
-  const batchJsonRaw = row[2];                                                                   // raw batch JSON string
-  const batchPositionRaw = row[3];                                                               // raw batch position
-  const pageToken = pageTokenRaw == null ? '' : String(pageTokenRaw);                            // normalize token
-  const threadsProcessed = parseInt(threadsProcessedRaw, 10) || 0;                               // normalize processed count
-  let currentBatch = [];                                                                         // placeholder for parsed batch
-  try {                                                                                          // try parse if present
-    currentBatch = batchJsonRaw ? JSON.parse(batchJsonRaw) : [];                                 // parse JSON to array or empty
-  } catch (e) {                                                                                  // if parse fails
-    currentBatch = [];                                                                           // fall back to empty
-  }                                                                                              // end try/catch
-  const batchPosition = parseInt(batchPositionRaw, 10) || 0;                                     // normalize position
-  return { pageToken, threadsProcessed, currentBatch, batchPosition };                            // return state object
-}                                                                                               // end loadCrawlerProgress
-
-// --------------------------- processThreadForCrawler --------------------------- //
-function processThreadForCrawler(threadStub, keeperEmails, sendersMap) {                          // process a single thread id (uses Gmail API)
-  let emailsFound = 0;                                                                           // counter of emails found in this thread
-  try {                                                                                          // wrap Gmail call in try
-    const thread = Gmail.Users.Threads.get('me', threadStub.id, {                               // get thread metadata/messages
-      format: 'metadata',
-      metadataHeaders: ['From','Date']
-    });                                                                                          // end get
-    const messages = thread.messages || [];                                                      // message list
-    for (let i = 0; i < messages.length; i++) {                                                  // iterate messages
-      const msg = messages[i];                                                                   // this message
-      const headers = msg.payload.headers || [];                                                 // headers array
-      const fromH = headers.find(h => h.name === 'From');                                       // locate From header
-      const dateH = headers.find(h => h.name === 'Date');                                       // locate Date header
-      if (!fromH) continue;                                                                      // skip if no From
-      const parsed = parseSenderInfo(fromH.value);                                              // parse name/email
-      const email = parsed.email ? parsed.email.toLowerCase() : '';                             // normalized email
-      if (!email || keeperEmails.indexOf(email) !== -1) continue;                                // skip keepers or invalid
-      emailsFound++;                                                                             // count one email
-      const baseEmail = email.includes('+') ? (email.split('+')[0] + '@' + email.split('@')[1]) : email; // base email
-      const messageDate = dateH ? new Date(dateH.value) : new Date(parseInt(msg.internalDate));   // get date
-      if (!sendersMap.has(baseEmail)) {                                                          // if new sender
-        sendersMap.set(baseEmail, { primaryName: parsed.name || baseEmail, email: baseEmail, date: messageDate, count: 1 }); // add
-      } else {                                                                                   // existing sender
-        const ex = sendersMap.get(baseEmail);                                                    // existing record
-        ex.count = (ex.count || 0) + 1;                                                          // increment count
-        if (messageDate > ex.date) { ex.date = messageDate; ex.primaryName = parsed.name || ex.primaryName; } // update date & name
-        sendersMap.set(baseEmail, ex);                                                           // save back
-      }                                                                                          // end else
-    }                                                                                            // end for messages
-  } catch (e) {                                                                                  // on error
-    console.warn('thread get err');                                                              // short warn
-  }                                                                                              // end try/catch
-  return { emailsFound };                                                                        // return summary
-}                                                                                               // end processThreadForCrawler
-
-// --------------------------- parseSenderInfo --------------------------- //
-function parseSenderInfo(fromValue) {                                                            // simple parser for "Name <email>" style From header
-  if (!fromValue) return { name: '', email: '' };                                                // guard empty
-  const m = fromValue.match(/^(.*?)[\s]*<(.+?)>$/);                                              // regex match name+email
-  if (m) return { name: m[1].trim(), email: m[2].trim() };                                        // return parsed parts
-  return { name: fromValue.trim(), email: fromValue.trim() };                                     // fallback single token
-}                                                                                               // end parseSenderInfo
-
-// --------------------------- getKeeperEmails --------------------------- //
-function getKeeperEmails() {                                                                     // load keeper emails from "Keepers" sheet
-  const out = [];                                                                                // array to return
-  try {                                                                                          // try reading sheet
-    const ss = SpreadsheetApp.getActiveSpreadsheet();                                            // get spreadsheet
-    const sheet = ss.getSheetByName('Keepers');                                                  // open keepers sheet
-    if (!sheet) return out;                                                                      // return empty if none
-    const data = sheet.getRange(2,1, sheet.getLastRow() - 1, 1).getValues() || [];               // read keeper rows
-    for (let i = 0; i < data.length; i++) {                                                      // loop rows
-      const v = data[i][0];                                                                      // cell value
-      if (v && typeof v === 'string') out.push(v.trim().toLowerCase());                          // push normalized
-    }                                                                                            // end loop
-  } catch (e) {                                                                                  // on error
-    console.warn('keepers err');                                                                  // short warn
-  }                                                                                              // end try/catch
-  return out;                                                                                    // return keeper emails
-}                                                                                               // end getKeeperEmails
-
-// --------------------------- loadSendersMapFromSheet --------------------------- //
-function loadSendersMapFromSheet() {                                                             // helper to load senders into a Map
-  const map = new Map();                                                                         // map to return
-  try {                                                                                          // try block
-    const ss = SpreadsheetApp.getActiveSpreadsheet();                                            // get spreadsheet
-    const sheet = ss.getSheetByName('Senders');                                                  // open senders sheet
-    if (!sheet || sheet.getLastRow() < 2) return map;                                            // nothing to load
-    const rows = sheet.getRange(2,1, sheet.getLastRow() - 1, 4).getValues();                     // read all senders rows
-    for (let i = 0; i < rows.length; i++) {                                                       // iterate rows
-      const r = rows[i];                                                                         // row
-      const email = (r[1] || '').toString().toLowerCase();                                       // normalize email
-      if (!email) continue;                                                                      // skip blanks
-      map.set(email, { primaryName: r[0], email: email, date: new Date(r[2]), count: r[3] || 0 }); // set map entry
-    }                                                                                            // end for
-  } catch (e) {                                                                                  // on error
-    console.warn('load senders err');                                                            // short warn
-  }                                                                                              // end try/catch
-  return map;                                                                                    // return map
-}                                                                                               // end loadSendersMapFromSheet
-
-// --------------------------- persistSendersMapToSheet --------------------------- //
-function persistSendersMapToSheet(map) {                                                         // write Map contents to Senders sheet (replace)
-  try {                                                                                          // try write
-    const ss = SpreadsheetApp.getActiveSpreadsheet();                                            // get spreadsheet
-    const sheet = ss.getSheetByName('Senders');                                                  // get sheet
-    if (!sheet) return;                                                                          // nothing to do without sheet
-    const arr = Array.from(map.values()).sort((a,b) => b.date - a.date).map(s => [s.primaryName, s.email, s.date, s.count]); // prepare rows
-    sheet.clearContents();                                                                        // clear old content
-    sheet.getRange(1,1,1,4).setValues([['Name','Email','Most Recent Email Date','Count of Emails']]); // header
-    if (arr.length > 0) sheet.getRange(2,1,arr.length,4).setValues(arr);                         // write rows
-  } catch (e) {                                                                                  // on error
-    console.warn('persist senders err');                                                         // warn
-  }                                                                                              // end try/catch
-}                                                                                               // end persistSendersMapToSheet
-
-// --------------------------- getTotalEmailsCount --------------------------- //
-function getTotalEmailsCount() {                                                                 // compute total emails from Senders sheet
-  try {                                                                                          // try read
-    const ss = SpreadsheetApp.getActiveSpreadsheet();                                            // get spreadsheet
-    const sheet = ss.getSheetByName('Senders');                                                  // open senders
-    if (!sheet || sheet.getLastRow() < 2) return 0;                                              // none present
-    const data = sheet.getRange(2,4,sheet.getLastRow()-1,1).getValues();                         // read counts column
-    return data.reduce((s,r) => s + (parseInt(r[0],10) || 0), 0);                                 // sum counts
-  } catch (e) {                                                                                  // on error
-    return 0;                                                                                    // fallback 0
-  }                                                                                              // end try/catch
-}                                                                                               // end getTotalEmailsCount
-
-// --------------------------- getUniqueSendersCount --------------------------- //
-function getUniqueSendersCount() {                                                               // get unique senders count from sheet
-  try {                                                                                          // try read
-    const ss = SpreadsheetApp.getActiveSpreadsheet();                                            // get spreadsheet
-    const sheet = ss.getSheetByName('Senders');                                                  // open sheet
-    if (!sheet) return 0;                                                                        // none present
-    return Math.max(0, sheet.getLastRow() - 1);                                                  // rows minus header
-  } catch (e) {                                                                                  // on error
-    return 0;                                                                                    // fallback 0
-  }                                                                                              // end try/catch
-}                                                                                               // end getUniqueSendersCount
-
-// --------------------------- timeLimitReached --------------------------- //
-function timeLimitReached(startTime) {                                                           // returns true if runtime is nearly exhausted
-  const BUFFER = 10000;                                                                          // leave buffer (ms) to save & schedule
-  return (Date.now() - startTime) >= (CRAWLER_RUN_MS - BUFFER);                                   // compare elapsed to allowed time minus buffer
-}                                                                                               // end timeLimitReached
-
-// --------------------------- updateCrawlerProgress --------------------------- //
-function updateCrawlerProgress(threadsProcessed, emailsFound, sendersCount) {                     // update counters in status sheet
-  try {                                                                                          // try update
-    const ss = SpreadsheetApp.getActiveSpreadsheet();                                            // get spreadsheet
-    const s = ss.getSheetByName('Crawler Status');                                               // open status sheet
-    if (!s) return;                                                                              // nothing to update
-    s.getRange('B4').setValue(new Date());                                                       // Last Update cell
-    if (threadsProcessed != null) s.getRange('B5').setValue(threadsProcessed);                   // Total Threads Processed
-    if (emailsFound != null) s.getRange('B6').setValue(emailsFound);                             // Total Emails Found
-    if (sendersCount != null) s.getRange('B7').setValue(sendersCount);                           // Unique Senders Found
-    PropertiesService.getScriptProperties().setProperty('totalThreadsProcessed', String(threadsProcessed || 0)); // persist total
-  } catch (e) {                                                                                  // on error
-    console.warn('update progress err');                                                          // warn
-  }                                                                                              // end try/catch
-}                                                                                               // end updateCrawlerProgress
-
-// --------------------------- updateCrawlerStatus --------------------------- //
-function updateCrawlerStatus(status, phase) {                                                              // Update crawler status sheet with given status and phase
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();                                               // Get active spreadsheet
-  const statusSheet = spreadsheet.getSheetByName("Crawler Status");                                         // Get the Crawler Status sheet
-  const now = new Date();                                                                                   // Current date/time
-  
-  statusSheet.getRange("B2").setValue(status);                                                              // Set status (e.g., RUNNING, SCHEDULED, etc.)
-  statusSheet.getRange("B3").setValue(statusSheet.getRange("B3").getValue() || now);                        // Set start time if not already set
-  statusSheet.getRange("B4").setValue(now);                                                                 // Update last update time
-  statusSheet.getRange("B11").setValue(phase);                                                              // Set current phase
-  
-  const totalThreads = statusSheet.getRange("B5").getValue() || 0;                                          // Read total threads from Gmail
-  const processedThreads = statusSheet.getRange("B7").getValue() || 0;                                      // Read total threads processed
-  let progressPercent = 0;                                                                                  // Default progress
-  
-  if (totalThreads > 0) {                                                                                   // If we have a valid total
-    progressPercent = Math.min(100, ((processedThreads / totalThreads) * 100).toFixed(1));                  // Calculate percentage, cap at 100%
-  }                                                                                                         // End if
-  
-  statusSheet.getRange("B10").setValue(`${progressPercent}%`);                                              // Write percentage to B10
-  console.log(`status: ${status}, progress: ${progressPercent}%`);                                          // Debug log
-}                                                                                                           // End updateCrawlerStatus
-
-// --------------------------- scheduleNextCrawlerRun --------------------------- //
-function scheduleNextCrawlerRun(delayMs = 3 * 60 * 1000) {                                       // schedule next run with optional delay
-  try {                                                                                          // try scheduling
-    clearCrawlerTriggers();                                                                      // clear existing crawler triggers
-    const nextTime = new Date(Date.now() + delayMs);                                             // compute next run time
-    ScriptApp.newTrigger('runCrawlerSession')                                                    // create new trigger for runCrawlerSession
-      .timeBased()                                                                                // make it a time-based trigger
-      .at(nextTime)                                                                               // set trigger to run at computed time
-      .create();                                                                                  // create the trigger
-    updateCrawlerStatus('SCHEDULED', `Next run: ${nextTime.toLocaleString()}`);                   // update status with planned run
-  } catch (e) {                                                                                  // on error
-    console.warn(`schedule err: ${e.message}`);                                                   // log detailed warning message
-  }                                                                                              // end try/catch
-}                                                                                                // end scheduleNextCrawlerRun
-
-// --------------------------- clearCrawlerTriggers --------------------------- //
-function clearCrawlerTriggers() {                                                                // remove all crawler-related triggers
-  const triggers = ScriptApp.getProjectTriggers();                                               // get all project triggers
-  for (const trigger of triggers) {                                                              // loop through each trigger
-    if (trigger.getHandlerFunction() === 'runCrawlerSession') {                                  // if trigger is for runCrawlerSession
-      ScriptApp.deleteTrigger(trigger);                                                          // delete this trigger
-    }                                                                                            // end if
-  }                                                                                              // end loop
-}                                                                                                // end clearCrawlerTriggers
+  updateCrawlerProgress(                                                        // Update the dashboard with the final counts.
+    parseInt(PropertiesService.getScriptProperties().getProperty('totalThreadsProcessed'), 10) || 0, // Get the final thread count.
+    getTotalEmailsCount(),                                                      // Get the final email count.
+    getUniqueSendersCount()                                                     // Get the final sender count.
+  );                                                                            // End of updateCrawlerProgress call.
+  updateCrawlerStatus('COMPLETE', 'Analysis complete');                         // Set the final status to "COMPLETE".
+  clearCrawlerTriggers();                                                       // Clear any remaining triggers.
+}                                                                               // End of completeCrawlerAnalysis function.
 
 
-// --------------------------- completeCrawlerAnalysis --------------------------- //
-function completeCrawlerAnalysis() {                                                             // finalize run and clear triggers
-  updateCrawlerStatus('COMPLETE', 'Analysis complete');                                          // set status to COMPLETE
-  clearCrawlerTriggers();                                                                        // remove scheduled triggers
-  console.log('complete');                                                                       // short complete log
-}                                                                                               // end completeCrawlerAnalysis
+// --------------------------- Core Logic Functions --------------------------- //
+/**
+ * @summary Processes a single email thread to extract sender information.
+ * @description This function takes a thread object (fetched from the API), iterates through
+ * its messages, parses the sender, and updates the in-memory maps. It contains no API calls.
+ * @param {object} thread - The full thread object from the Gmail API.
+ * @param {Map} sendersMap - The in-memory map of sender data to be updated.
+ * @param {Map} nameVarMap - The in-memory map of name variations to be updated.
+ */
+function processThreadForCrawler(thread, sendersMap, nameVarMap) {              // Function definition to process one thread.
+  const messages = thread.messages || [];                                       // Get the messages from the thread, or an empty array.
+  for (const msg of messages) {                                                 // Loop through each message in the thread.
+    const headers = msg.payload && msg.payload.headers ? msg.payload.headers : []; // Get the headers for the message.
+    const fromH = headers.find(h => h.name.toLowerCase() === 'from');           // Find the 'From' header.
+    const dateH = headers.find(h => h.name.toLowerCase() === 'date');           // Find the 'Date' header.
+    if (!fromH || !fromH.value) continue;                                       // If there's no 'From' header, skip to the next message.
 
-// --------------------------- checkCrawlerStatus --------------------------- //
-function checkCrawlerStatus() {                                                                  // quick helper to show status in logs
-  try {                                                                                          // try show
-    const ss = SpreadsheetApp.getActiveSpreadsheet();                                            // get spreadsheet
-    const s = ss.getSheetByName('Crawler Status');                                               // open status sheet
-    const status = s ? s.getRange('B2').getValue() : 'NOT FOUND';                                // read status cell
-    console.log(`status: ${status}`);                                                            // log status
-  } catch (e) {                                                                                  // on error
-    console.warn('check status err');                                                             // warn
-  }                                                                                              // end try/catch
-}                                                                                               // end checkCrawlerStatus
+    const parsed = parseSenderInfo(fromH.value);                                // Parse the 'From' header into name and email.
+    const emailRaw = (parsed.email || '').toLowerCase().trim();                 // Normalize the email address (lowercase, trimmed).
+    if (!emailRaw) continue;                                                    // If the email is empty, skip it.
 
-// --------------------------- Helpers / Backwards-compat --------------------------- //
-// These helpers are thin wrappers to match previous API expectations and to keep small-surface changes.
-// persistSendersMapToSheet and collect/load helpers above are used by runCrawlerSession.
+    const baseEmail = (emailRaw.includes('+')) ? (emailRaw.split('+')[0] + '@' + emailRaw.split('@')[1]) : emailRaw; // Remove plus-addressing to get the base email.
+    const messageDate = dateH && dateH.value ? new Date(dateH.value) : new Date(parseInt(msg.internalDate, 10)); // Get the message date.
 
-// If you want me to change any naming, formatting, or make comments aligned to a fixed column width,
-// tell me the column number and I'll regenerate with perfect alignment.
+    const entry = sendersMap.get(baseEmail);                                    // Check if the sender already exists in the map.
+    if (!entry) {                                                               // If the sender is new...
+      sendersMap.set(baseEmail, { primaryName: parsed.name || baseEmail, email: baseEmail, date: messageDate, count: 1 }); // ...create a new entry.
+    } else {                                                                    // If the sender exists...
+      entry.count++;                                                            // ...increment their email count.
+      if (messageDate > entry.date) {                                           // ...if the new message is more recent...
+        entry.date = messageDate;                                               // ......update the last seen date.
+        entry.primaryName = parsed.name || entry.primaryName;                   // ......and update their primary name.
+      }                                                                         // ...end of date check.
+    }                                                                           // End of if/else block.
+
+    if (!nameVarMap.has(baseEmail)) nameVarMap.set(baseEmail, new Set());       // Ensure a Set exists for this email in the name variations map.
+    const nm = (parsed.name || '').trim();                                      // Get the name variant from this email.
+    if (nm && !nm.includes('@')) nameVarMap.get(baseEmail).add(nm);             // If the name is valid, add it to the set of variations.
+  }                                                                             // End of message loop.
+}                                                                               // End of processThreadForCrawler function.
+
+
+// --------------------------- Gmail API Service --------------------------- //
+/**
+ * @summary Quickly counts all Gmail threads using GmailApp.search in batches.
+ */
+function countAllGmailThreadsFast() {                                       // Function definition for fast thread counting.
+  const BATCH_SIZE = 500;                                                   // Set the number of threads to fetch in each batch.
+  let totalThreads = 0;                                                     // Initialize a counter for the total number of threads.
+  let startIndex = 0;                                                       // Initialize the starting index for the search.
+  console.info('Counting all Gmail threads in batches of', BATCH_SIZE);     // Log the start of the counting process.
+
+  while (true) {                                                            // Start an infinite loop (will be broken manually).
+    const batch = GmailApp.search('', startIndex, BATCH_SIZE);              // Search for threads, getting a batch of 500.
+    totalThreads += batch.length;                                           // Add the number of threads in the current batch to the total.
+    startIndex += BATCH_SIZE;                                               // Increment the starting index for the next batch.
+    console.info('Batch count:', batch.length, 'Total so far:', totalThreads); // Log the progress for the current batch.
+    if (batch.length < BATCH_SIZE) break;                                   // If a batch has fewer than 500 threads, it's the last one, so exit the loop.
+  }                                                                         // End of while loop.
+
+  console.info('Total Gmail threads found:', totalThreads);                 // Log the final total.
+  const ss = SpreadsheetApp.getActiveSpreadsheet();                         // Get the active spreadsheet.
+  const statusSheet = ss.getSheetByName('Crawler Status');                  // Get the status sheet.
+  statusSheet.getRange('B6').setValue(totalThreads);                        // Write the final total to the status sheet.
+  return totalThreads;                                                      // Return the total count.
+}                                                                           // End of countAllGmailThreadsFast function.
+
+/**
+ * @summary Fetches a batch of thread IDs from the Gmail API.
+ * @param {string} pageToken - The token for the page to fetch.
+ * @returns {object|null} The API response object or null on failure.
+ */
+function fetchThreadBatch(pageToken) {                                      // Function definition for fetching a batch of threads.
+  const listOptions = { maxResults: 50 };                                   // Prepare options for the API call, requesting 50 threads.
+  if (pageToken) listOptions.pageToken = pageToken;                         // If a page token is provided, add it to the options.
+  try {                                                                     // Start a try block for the API call.
+    const response = Gmail.Users.Threads.list('me', listOptions);           // Call the Gmail API to get a list of threads.
+    return {                                                                // Return a structured response object.
+      threads: response.threads || [],                                      // The list of threads.
+      nextToken: response.nextPageToken || ''                               // The token for the next page.
+    };                                                                      // End of return object.
+  } catch (e) {                                                             // If the API call fails...
+    console.error('Gmail API error while fetching thread list:', e);        // ...log the error.
+    return null;                                                            // ...and return null.
+  }                                                                         // End of try-catch block.
+}                                                                           // End of fetchThreadBatch function.
+
+/**
+ * @summary Fetches the detailed metadata for a single thread, with a retry mechanism.
+ * @param {string} threadId - The ID of the thread to fetch.
+ * @returns {object|null} The thread object from the API, or null on failure.
+ */
+function fetchThreadDetails(threadId) {                                     // Function definition for fetching thread details.
+  const MAX_RETRIES = 3;                                                    // Define the maximum number of retry attempts.
+  for (let i = 0; i < MAX_RETRIES; i++) {                                   // Start a loop for retry attempts.
+    try {                                                                   // Start a try block for the API call.
+      return Gmail.Users.Threads.get('me', threadId, { format: 'metadata', metadataHeaders: ['From', 'Date'] }); // Get thread metadata and return it.
+    } catch (e) {                                                           // If the API call fails...
+      if (i < MAX_RETRIES - 1) {                                            // ...and it's not the last attempt...
+        console.log(`API error for thread ${threadId}, retrying... (${i + 1}/${MAX_RETRIES})`); // ...log a retry message.
+        Utilities.sleep(1000);                                              // ...wait for 1 second before the next attempt.
+      } else {                                                              // If it is the last attempt...
+        console.warn('Could not process thread ID:', threadId, e);          // ...log the final warning.
+      }                                                                     // End of if/else block.
+    }                                                                       // End of try-catch block.
+  }                                                                         // End of retry loop.
+  return null;                                                              // If all retries fail, return null.
+}                                                                           // End of fetchThreadDetails function.
+
+
+// --------------------------- Sheet Service Functions --------------------------- //
+/**
+ * @summary Ensure required sheets exist, create headers, and optionally schedule the first count.
+ */
+function prepareCrawlerSheets(fresh = false) {                              // Function definition to set up the spreadsheet.
+  const ss = SpreadsheetApp.getActiveSpreadsheet();                         // Get the currently active spreadsheet object.
+  console.info('Preparing crawler sheets. Fresh start:', fresh);            // Log that the sheet preparation is starting.
+
+  // ---------- Crawler Progress sheet ----------
+  let progressSheet = ss.getSheetByName('Crawler Progress');                // Get the sheet named "Crawler Progress".
+  if (!progressSheet) progressSheet = ss.insertSheet('Crawler Progress');   // If the sheet doesn't exist, create it.
+  progressSheet.clear();                                                    // Clear all content from the progress sheet.
+  progressSheet.getRange('A1:D1').setValues([['Page Token', 'Threads Processed', 'Batch JSON', 'Batch Pos']]); // Set the header row for the progress sheet.
+  progressSheet.getRange('A2:D2').setValues([['START', 0, '', 0]]);          // Set the initial progress data to 'START'.
+
+  // ---------- Crawler Status sheet ----------
+  let statusSheet = ss.getSheetByName('Crawler Status');                    // Get the sheet named "Crawler Status".
+  if (!statusSheet) statusSheet = ss.insertSheet('Crawler Status');         // If the sheet doesn't exist, create it.
+  statusSheet.clear();                                                      // Clear all content from the status sheet.
+  statusSheet.getRange('A1:B11').setValues([                                // Set up the layout and labels for the status dashboard.
+    ['Crawler Status', ''], ['Status', ''], ['Started', ''], ['Last Update', ''], ['Trigger Count', ''],
+    ['Total Threads Found', ''], ['Total Threads Processed', 0], ['Estimated Progress', '=IF(B6=0, 0, B7/B6)'],
+    ['Total Emails Found', 0], ['Unique Senders Found', 0], ['Current Phase', '']
+  ]);                                                                       // End of status sheet values.
+  statusSheet.getRange('B8').setNumberFormat('0.00%');                      // Format the formula cell as a percentage.
+  statusSheet.getRange('A1:A').setFontWeight('bold');                       // Make the first column of the status sheet bold for readability.
+
+  // ---------- Senders sheet ----------
+  let sendersSheet = ss.getSheetByName('Senders');                          // Get the sheet named "Senders".
+  if (!sendersSheet) sendersSheet = ss.insertSheet('Senders');              // If the sheet doesn't exist, create it.
+  if (fresh) sendersSheet.clear();                                          // If it's a fresh start, clear the sheet.
+  if (sendersSheet.getLastRow() < 1) {                                      // If the sheet is completely empty...
+    sendersSheet.getRange(1, 1, 1, 4).setValues([['Name', 'Email', 'Last Seen', 'Count']]); // ...add the header row.
+  }                                                                         // End of if block.
+  sendersSheet.setFrozenRows(1);                                            // Freeze the header row so it's always visible.
+  if (!sendersSheet.getFilter()) {                                          // If there is no filter on the sheet...
+    try { sendersSheet.getRange(1, 1, sendersSheet.getMaxRows(), 4).createFilter(); } catch (e) {} // ...add one to allow sorting.
+  }                                                                         // End of if block.
+
+  // ---------- Name Variations sheet ----------
+  let nvSheet = ss.getSheetByName('Name Variations');                       // Get the sheet named "Name Variations".
+  if (!nvSheet) nvSheet = ss.insertSheet('Name Variations');                // If the sheet doesn't exist, create it.
+  if (fresh) nvSheet.clear();                                               // If it's a fresh start, clear the sheet.
+  if (nvSheet.getLastRow() < 1) {                                           // If the sheet is completely empty...
+    nvSheet.getRange(1, 1, 1, 2).setValues([['Email', 'Name Variations']]);  // ...add the header row.
+  }                                                                         // End of if block.
+  nvSheet.setFrozenRows(1);                                                 // Freeze the header row.
+  if (!nvSheet.getFilter()) {                                               // If there is no filter on the sheet...
+    try { nvSheet.getRange(1, 1, nvSheet.getMaxRows(), 2).createFilter(); } catch (e) {} // ...add one.
+  }                                                                         // End of if block.
+
+  // ---------- If fresh → start fast count in separate run ----------
+  if (fresh) {                                                              // If this is a fresh start...
+    updateCrawlerStatus('INITIALIZING', 'Counting threads...');             // ...update the status to show initialization is in progress.
+    ScriptApp.newTrigger('countThreadsAndStart').timeBased().after(2000).create(); // ...create a new trigger to run the counting function after 2 seconds.
+    console.info('Scheduling thread count');                                // ...log that the counting has been scheduled.
+  }                                                                         // End of if block.
+}                                                                           // End of prepareCrawlerSheets function.
+
+/**
+ * @summary Persist crawler progress into the "Crawler Progress" sheet.
+ */
+function saveProgress(pageToken, threadsProcessed, currentBatch, batchPosition) { // Function definition to save progress.
+  const ss = SpreadsheetApp.getActiveSpreadsheet();                             // Get the active spreadsheet.
+  const ps = ss.getSheetByName('Crawler Progress');                             // Get the progress sheet.
+  if (!ps) return;                                                              // If the sheet doesn't exist, do nothing.
+  const json = (Array.isArray(currentBatch) && currentBatch.length) ? JSON.stringify(currentBatch) : ''; // Convert the current batch array to a JSON string.
+  ps.getRange('A2:D2').setValues([[pageToken || '', threadsProcessed || 0, json, batchPosition || 0]]); // Write all the progress data to the sheet in one go.
+}                                                                               // End of saveProgress function.
+
+/**
+ * @summary Read and normalize the saved progress from the "Crawler Progress" sheet.
+ */
+function loadCrawlerProgress() {                                                // Function definition to load progress.
+  const ss = SpreadsheetApp.getActiveSpreadsheet();                             // Get the active spreadsheet.
+  const ps = ss.getSheetByName('Crawler Progress');                             // Get the progress sheet.
+  if (!ps || ps.getLastRow() < 2) return { pageToken: 'START', threadsProcessed: 0, currentBatch: [], batchPosition: 0 }; // If no progress is saved, return a 'START' state.
+  const row = ps.getRange('A2:D2').getValues()[0];                              // Read the progress data row.
+  const pageToken = row[0] == null ? '' : String(row[0]);                       // Get the page token, ensuring it's a string.
+  const threadsProcessed = parseInt(row[1], 10) || 0;                           // Get the processed count, ensuring it's an integer.
+  let currentBatch = [];                                                        // Initialize an empty array for the batch.
+  try {                                                                         // Start a try block for safe JSON parsing.
+    currentBatch = row[2] ? JSON.parse(row[2]) : [];                            // Parse the JSON string back into an array.
+  } catch (e) { currentBatch = []; }                                            // If parsing fails, use an empty array.
+  const batchPosition = parseInt(row[3], 10) || 0;                              // Get the batch position, ensuring it's an integer.
+  return { pageToken, threadsProcessed, currentBatch, batchPosition };          // Return the loaded progress as an object.
+}                                                                               // End of loadCrawlerProgress function.
+
+/**
+ * @summary Loads the Senders sheet into an in-memory Map for fast access.
+ */
+function loadSendersMapFromSheet() {                                            // Function definition to load the senders sheet.
+  const map = new Map();                                                        // Create a new Map object.
+  try {                                                                         // Start a try block for sheet operations.
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Senders'); // Get the "Senders" sheet.
+    if (!sheet || sheet.getLastRow() < 2) return map;                           // If the sheet is empty, return the empty map.
+    const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 4).getValues();   // Get all the data rows from the sheet.
+    for (const r of rows) {                                                     // Loop through each row.
+      const email = (r[1] || '').toString().toLowerCase();                      // Get and normalize the email from the second column.
+      if (!email) continue;                                                     // If the email is blank, skip to the next row.
+      const dateVal = r[2] ? new Date(r[2]) : new Date(0);                      // Get the date from the third column, converting it to a Date object.
+      map.set(email, { primaryName: r[0], email: email, date: dateVal, count: parseInt(r[3], 10) || 0 }); // Add the sender's data to the map.
+    }                                                                           // End of loop.
+  } catch (e) { console.warn('load senders err', e); }                          // If an error occurs, log a warning.
+  return map;                                                                   // Return the populated map.
+}                                                                               // End of loadSendersMapFromSheet function.
+
+/**
+ * @summary Loads the Name Variations sheet into an in-memory Map.
+ */
+function loadNameVariationsMapFromSheet() {                                     // Function definition to load the name variations sheet.
+  const map = new Map();                                                        // Create a new Map object.
+  try {                                                                         // Start a try block for sheet operations.
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Name Variations'); // Get the "Name Variations" sheet.
+    if (!sheet || sheet.getLastRow() < 2) return map;                           // If the sheet is empty, return the empty map.
+    const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getValues();   // Get all the data rows.
+    for (const row of rows) {                                                   // Loop through each row.
+      const email = (row[0] || '').toString().toLowerCase();                    // Get and normalize the email from the first column.
+      if (!email) continue;                                                     // If the email is blank, skip it.
+      const set = new Set((row[1] || '').toString().split(' | ').map(s => s.trim()).filter(Boolean)); // Get the variations string, split it, and create a Set of names.
+      map.set(email, set);                                                      // Add the email and its set of names to the map.
+    }                                                                           // End of loop.
+  } catch (e) { console.warn('load name variations err', e); }                  // If an error occurs, log a warning.
+  return map;                                                                   // Return the populated map.
+}                                                                               // End of loadNameVariationsMapFromSheet function.
+
+/**
+ * @summary Writes the in-memory sendersMap to the "Senders" sheet.
+ */
+function persistSendersMapToSheet(map) {                                        // Function definition to save the senders map.
+  try {                                                                         // Start a try block for sheet operations.
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Senders'); // Get the "Senders" sheet.
+    if (!sheet) return;                                                         // If the sheet doesn't exist, do nothing.
+    const arr = Array.from(map.values()).sort((a, b) => (b.date || 0) - (a.date || 0)); // Convert the map values to an array and sort by date descending.
+    const rows = arr.map(s => [s.primaryName, s.email, s.date, s.count]);       // Convert the array of objects to a 2D array for writing to the sheet.
+
+    sheet.clearContents();                                                      // Clear all existing data from the sheet.
+    sheet.getRange(1, 1, 1, 4).setValues([['Name', 'Email', 'Last Seen', 'Count']]); // Write the header row.
+    if (rows.length > 0) {                                                      // If there is data to write...
+        sheet.getRange(2, 1, rows.length, 4).setValues(rows);                   // ...write all the rows to the sheet.
+    }                                                                           // End of if block.
+    sheet.setFrozenRows(1);                                                     // Freeze the header row.
+    if (sheet.getFilter()) sheet.getFilter().remove();                          // Remove any existing filter to prevent errors.
+    sheet.getRange(1, 1, sheet.getMaxRows(), 4).createFilter();                 // Create a new filter on the data range.
+    if (rows.length > 0) {                                                      // If there are rows...
+        sheet.getRange(2, 1, rows.length, 4).sort({ column: 3, ascending: false }); // ...sort the sheet by the "Last Seen" column (column 3).
+    }                                                                           // End of if block.
+  } catch (e) { console.warn('persist senders err', e); }                       // If an error occurs, log a warning.
+}                                                                               // End of persistSendersMapToSheet function.
+
+/**
+ * @summary Writes the in-memory name variations map to its sheet, sorted alphabetically.
+ */
+function persistNameVariationsMapToSheet(map) {                                 // Function definition to save the name variations map.
+  try {                                                                         // Start a try block for sheet operations.
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Name Variations'); // Get the "Name Variations" sheet.
+    if (!sheet) return;                                                         // If the sheet doesn't exist, do nothing.
+    const rows = Array.from(map.entries())                                      // Convert the map to an array of [email, set] pairs.
+      .filter(([email, set]) => set.size > 1)                                   // Keep only the entries where the Set of names has more than one item.
+      .sort((a, b) => a[0].localeCompare(b[0]))                                 // Sort the array alphabetically based on the email address (the first element).
+      .map(([email, set]) => [email, Array.from(set || []).join(' | ')]);        // Convert the filtered entries to a 2D array, joining the Set of names with a separator.
+    sheet.clearContents();                                                      // Clear all existing data from the sheet.
+    sheet.getRange(1, 1, 1, 2).setValues([['Email', 'Name Variations']]);       // Write the header row.
+    if (rows.length > 0) sheet.getRange(2, 1, rows.length, 2).setValues(rows);   // If there is data, write it to the sheet.
+    sheet.setFrozenRows(1);                                                     // Freeze the header row.
+    if (sheet.getFilter()) sheet.getFilter().remove();                          // Remove any existing filter.
+    sheet.getRange(1, 1, sheet.getMaxRows(), 2).createFilter();                 // Create a new filter.
+  } catch (e) { console.warn('persist name variations err', e); }               // If an error occurs, log a warning.
+}                                                                               // End of persistNameVariationsMapToSheet function.
+
+/**
+ * @summary Returns the total number of emails counted from the Senders sheet.
+ */
+function getTotalEmailsCount() {                                                // Function definition to get the total email count.
+  try {                                                                         // Start a try block for sheet operations.
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Senders'); // Get the "Senders" sheet.
+    if (!sheet || sheet.getLastRow() < 2) return 0;                             // If the sheet is empty, return 0.
+    const data = sheet.getRange(2, 4, sheet.getLastRow() - 1, 1).getValues();   // Get all values from the "Count" column (column 4).
+    return data.reduce((sum, row) => sum + (parseInt(row[0], 10) || 0), 0);      // Use reduce to sum all the values in the column.
+  } catch (e) { console.warn('get total emails err', e); return 0; }            // If an error occurs, log a warning and return 0.
+}                                                                               // End of getTotalEmailsCount function.
+
+/**
+ * @summary Returns the number of unique senders from the Senders sheet.
+ */
+function getUniqueSendersCount() {                                              // Function definition to get the unique sender count.
+  try {                                                                         // Start a try block for sheet operations.
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Senders'); // Get the "Senders" sheet.
+    return sheet ? Math.max(0, sheet.getLastRow() - 1) : 0;                     // Return the number of rows minus 1 (for the header).
+  } catch (e) { console.warn('unique senders err', e); return 0; }              // If an error occurs, log a warning and return 0.
+}                                                                               // End of getUniqueSendersCount function.
+
+/**
+ * @summary Updates progress counters in the 'Crawler Status' sheet.
+ */
+function updateCrawlerProgress(threadsProcessed, emailsFound, sendersCount) {   // Function definition to update the progress dashboard.
+  try {                                                                         // Start a try block for sheet operations.
+    const s = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Crawler Status'); // Get the "Crawler Status" sheet.
+    if (!s) return;                                                             // If the sheet doesn't exist, do nothing.
+    s.getRange('B4').setValue(new Date());                                      // Update the "Last Update" timestamp.
+    if (threadsProcessed != null) s.getRange('B7').setValue(threadsProcessed);  // Update the "Total Threads Processed" count.
+    if (emailsFound != null) s.getRange('B9').setValue(emailsFound);            // Update the "Total Emails Found" count.
+    if (sendersCount != null) s.getRange('B10').setValue(sendersCount);         // Update the "Unique Senders Found" count.
+    PropertiesService.getScriptProperties().setProperty('totalThreadsProcessed', String(threadsProcessed || 0)); // Save the thread count to script properties for persistence.
+  } catch (e) { console.warn('update progress err', e); }                       // If an error occurs, log a warning.
+}                                                                               // End of updateCrawlerProgress function.
+
+/**
+ * @summary Updates the status message on the dashboard.
+ */
+function updateCrawlerStatus(status, message) {                                 // Function definition to update the status.
+  const ss = SpreadsheetApp.getActiveSpreadsheet();                             // Get the active spreadsheet.
+  const statusSheet = ss.getSheetByName('Crawler Status');                      // Get the "Crawler Status" sheet.
+  if (!statusSheet) return;                                                     // If the sheet doesn't exist, do nothing.
+  const now = new Date();                                                       // Get the current time.
+  statusSheet.getRange('B2').setValue(status);                                  // Set the main status message.
+  const startedVal = statusSheet.getRange('B3').getValue();                     // Get the value of the "Started" cell.
+  if (!startedVal && (status === 'INITIALIZING' || status === 'INITIALIZED')) { // If the "Started" cell is empty and the status is initializing...
+    statusSheet.getRange('B3').setValue(now);                                   // ...set the "Started" timestamp.
+  }                                                                             // End of if block.
+  statusSheet.getRange('B4').setValue(now);                                     // Set the "Last Update" timestamp.
+  if (message) statusSheet.getRange('B11').setValue(message);                   // If a descriptive message was provided, set it.
+  console.info('Status updated:', status, '-', message || '');                  // Log the status update.
+}                                                                               // End of updateCrawlerStatus function.
+
+/**
+ * @summary Updates the Keepers sheet with full sender data.
+ */
+function moveKeepersToEnd() {                                                   // Function definition for moving keepers.
+  try {                                                                         // Start a try block for sheet operations.
+    const ss = SpreadsheetApp.getActiveSpreadsheet();                           // Get the active spreadsheet.
+    const sendersSheet = ss.getSheetByName('Senders');                          // Get the "Senders" sheet.
+    const keepersSheet = ss.getSheetByName('Keepers');                          // Get the "Keepers" sheet.
+
+    if (!sendersSheet || !keepersSheet || sendersSheet.getLastRow() < 2) {      // If any required sheet is missing or Senders is empty...
+      console.info('Skipping keeper move: No sender data to process.');         // ...log a message and exit.
+      return;                                                                   // ...stop the function.
+    }                                                                           // End of if block.
+
+    const sendersData = sendersSheet.getRange(2, 1, sendersSheet.getLastRow() - 1, 4).getValues(); // Get all data from the Senders sheet.
+    const keepersData = keepersSheet.getRange(1, 1, keepersSheet.getLastRow(), 1).getValues(); // Get the list of keeper emails.
+    const keepersMap = new Map(keepersData.map((row, i) => [row[0].toLowerCase().trim(), i + 1])); // Create a map of keeper emails to their row number.
+
+    const rowsToKeepInSenders = [];                                             // Initialize an array for senders that are not keepers.
+    const keepersToUpdate = [];                                                 // Initialize an array for keepers that need updating.
+
+    for (const senderRow of sendersData) {                                      // Loop through each row of sender data.
+      const email = senderRow[1].toLowerCase().trim();                          // Get and normalize the sender's email.
+      if (keepersMap.has(email)) {                                              // If the sender's email is in the keepers map...
+        const rowIndex = keepersMap.get(email);                                 // ...get the row number from the keepers map.
+        keepersToUpdate.push({ row: rowIndex, data: senderRow });               // ...add the row number and data to the update list.
+      } else {                                                                  // Otherwise...
+        rowsToKeepInSenders.push(senderRow);                                    // ...add the sender row to the list of rows to keep.
+      }                                                                         // End of if/else block.
+    }                                                                           // End of loop.
+
+    if (keepersToUpdate.length > 0) {                                           // If there are any keepers to update...
+      console.info(`Updating ${keepersToUpdate.length} sender(s) in the Keepers sheet.`); // ...log how many are being updated.
+
+      for (const keeper of keepersToUpdate) {                                   // Loop through each keeper to be updated.
+        keepersSheet.getRange(keeper.row, 1, 1, 4).setValues([keeper.data]);    // Write the full 4-column sender data to the correct row in the Keepers sheet.
+      }                                                                         // End of loop.
+      
+      keepersSheet.getRange(1, 1, 1, 4).setValues([['Name', 'Email', 'Last Seen', 'Count']]); // Set the 4-column header.
+
+      sendersSheet.clearContents();                                             // Clear the entire Senders sheet.
+      sendersSheet.getRange(1, 1, 1, 4).setValues([['Name', 'Email', 'Last Seen', 'Count']]); // Write the header back to the Senders sheet.
+      if (rowsToKeepInSenders.length > 0) {                                     // If there are any senders left...
+        sendersSheet.getRange(2, 1, rowsToKeepInSenders.length, 4).setValues(rowsToKeepInSenders); // ...write them back to the Senders sheet.
+      }                                                                         // End of if block.
+
+    } else {                                                                    // If no matching keepers were found...
+      console.info('No senders found matching the Keepers list.');              // ...log that no action was taken.
+    }                                                                           // End of if/else block.
+  } catch (e) {                                                                 // If any error occurs during the process...
+    console.error('Error while moving keepers:', e);                            // ...log a detailed error message.
+  }                                                                             // End of try-catch block.
+}                                                                               // End of moveKeepersToEnd function.
+
+
+// --------------------------- Trigger Management Functions --------------------------- //
+/**
+ * @summary Clears existing crawler triggers and schedules the next run.
+ */
+function scheduleNextCrawlerRun(delayMs = 2 * 60 * 1000) {                      // Function definition to schedule the next run.
+  try {                                                                         // Start a try block for trigger service operations.
+    clearCrawlerTriggers();                                                     // Clear any old recurring triggers.
+    const nextTime = new Date(Date.now() + delayMs);                            // Calculate the time for the next run.
+    ScriptApp.newTrigger('runCrawlerSession').timeBased().at(nextTime).create(); // Create a new trigger to run at the calculated time.
+    updateTriggerCountInStatus();                                               // Update the trigger count on the dashboard.
+    updateCrawlerStatus('SCHEDULED', `Next run: ${nextTime.toLocaleString()}`); // Update the status to "SCHEDULED" with the next run time.
+    console.info('Next run scheduled for', nextTime);                           // Log the time of the next scheduled run.
+  } catch (e) { console.warn('schedule err', e); }                              // If an error occurs, log a warning.
+}                                                                               // End of scheduleNextCrawlerRun function.
+
+/**
+ * @summary Clears only the recurring 'runCrawlerSession' triggers.
+ */
+function clearCrawlerTriggers() {                                               // Function definition to clear triggers.
+  try {                                                                         // Start a try block for trigger service operations.
+    ScriptApp.getProjectTriggers().forEach(t => {                               // Get all project triggers and loop through them.
+      if (t.getHandlerFunction() === 'runCrawlerSession') {                     // If the trigger is for the main session function...
+        ScriptApp.deleteTrigger(t);                                             // ...delete it.
+        console.info('Deleted trigger:', t.getHandlerFunction());               // ...and log that it was deleted.
+      }                                                                         // End of if block.
+    });                                                                         // End of loop.
+    updateTriggerCountInStatus();                                               // Update the trigger count on the dashboard.
+  } catch (e) { console.warn('clear triggers err', e); }                        // If an error occurs, log a warning.
+}                                                                               // End of clearCrawlerTriggers function.
+
+/**
+ * @summary Counts active crawler-related triggers and writes the count to the status sheet.
+ */
+function updateTriggerCountInStatus() {                                         // Function definition to update the trigger count.
+  try {                                                                         // Start a try block for trigger service operations.
+    const triggers = ScriptApp.getProjectTriggers();                            // Get all triggers for this script project.
+    const count = triggers.filter(t => ['runCrawlerSession', 'countThreadsAndStart'].includes(t.getHandlerFunction())).length; // Count how many triggers match the crawler's function names.
+    const statusSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Crawler Status'); // Get the "Crawler Status" sheet.
+    if (statusSheet) statusSheet.getRange('B5').setValue(count);                // If the sheet exists, write the count to it.
+  } catch (e) { console.warn('update trigger count err', e); }                  // If an error occurs, log a warning.
+}                                                                               // End of updateTriggerCountInStatus function.
+
+
+// --------------------------- Utility & Debug Functions --------------------------- //
+/**
+ * @summary Parse "From" header value into a name and email.
+ */
+function parseSenderInfo(fromValue) {                                           // Function definition to parse sender info.
+  if (!fromValue) return { name: '', email: '' };                               // If the input is empty, return an empty object.
+  const m = fromValue.match(/^(.*?)\s*<(.+?)>$/);                               // Try to match the "Name <email>" format using a regular expression.
+  if (m && m[2]) return { name: m[1].replace(/"/g, '').trim(), email: m[2].trim() }; // If it matches, return the cleaned name and email.
+  return { name: '', email: fromValue.trim() };                                 // Otherwise, assume the whole string is the email.
+}                                                                               // End of parseSenderInfo function.
+
+/**
+ * @summary Checks if the script is approaching its execution time limit.
+ */
+function timeLimitReached(startTime) {                                          // Function definition to check the time limit.
+  const BUFFER_MS = 15000;                                                      // Define a 15-second safety buffer.
+  return (Date.now() - startTime) >= (CRAWLER_RUN_MS - BUFFER_MS);              // Return true if the elapsed time is greater than the limit minus the buffer.
+}                                                                               // End of timeLimitReached function.
+
+/**
+ * @summary A quick helper function to log the current status for debugging.
+ */
+function checkCrawlerStatus() {                                                 // Function definition for the debug helper.
+  try {                                                                         // Start a try block for sheet operations.
+    const s = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Crawler Status'); // Get the "Crawler Status" sheet.
+    const status = s ? s.getRange('B2').getValue() : 'NOT FOUND';               // Get the value from the status cell.
+    console.info('Crawler status:', status);                                    // Log the current status.
+  } catch (e) { console.warn('check status err', e); }                          // If an error occurs, log a warning.
+}                                                                               // End of checkCrawlerStatus function.
