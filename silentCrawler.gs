@@ -5,7 +5,7 @@
  * until the entire Gmail account has been processed. Tracks senders, name variations,
  * totals, progress %, trigger count, and preserves progress across runs.
  *
- * Version 13: Added tracking for both Thread Count and Email Count.
+ * Version 14: Merged Crawler Progress into the Crawler Status sheet for consolidation.
  */
 
 // --------------------------- Globals --------------------------- //
@@ -346,21 +346,26 @@ function prepareCrawlerSheets(fresh = false) {                              // F
   const ss = SpreadsheetApp.getActiveSpreadsheet();                         // Get the currently active spreadsheet object.
   console.info('Preparing crawler sheets. Fresh start:', fresh);            // Log that the sheet preparation is starting.
 
-  // ---------- Crawler Progress sheet ----------
-  let progressSheet = ss.getSheetByName('Crawler Progress');                // Get the sheet named "Crawler Progress".
-  if (!progressSheet) progressSheet = ss.insertSheet('Crawler Progress');   // If the sheet doesn't exist, create it.
-  progressSheet.clear();                                                    // Clear all content from the progress sheet.
-  progressSheet.getRange('A1:D1').setValues([['Page Token', 'Threads Processed', 'Batch JSON', 'Batch Pos']]); // Set the header row for the progress sheet.
-  progressSheet.getRange('A2:D2').setValues([['START', 0, '', 0]]);          // Set the initial progress data to 'START'.
-
   // ---------- Crawler Status sheet ----------
   let statusSheet = ss.getSheetByName('Crawler Status');                    // Get the sheet named "Crawler Status".
   if (!statusSheet) statusSheet = ss.insertSheet('Crawler Status');         // If the sheet doesn't exist, create it.
   statusSheet.clear();                                                      // Clear all content from the status sheet.
-  statusSheet.getRange('A1:B11').setValues([                                // Set up the layout and labels for the status dashboard.
-    ['Crawler Status', ''], ['Status', ''], ['Started', ''], ['Last Update', ''], ['Trigger Count', ''],
-    ['Total Threads Found', ''], ['Total Threads Processed', 0], ['Estimated Progress', '=IF(B6=0, 0, B7/B6)'],
-    ['Total Emails Found', 0], ['Unique Senders Found', 0], ['Current Phase', '']
+  statusSheet.getRange('A1:B15').setValues([                                // Set up the layout and labels for the status dashboard.
+    ['Crawler Status', ''],                                                 // Title for the status dashboard.
+    ['Status', ''],                                                         // Label for the current status (e.g., RUNNING, STOPPED).
+    ['Started', ''],                                                        // Label for the timestamp when the crawl started.
+    ['Last Update', ''],                                                    // Label for the timestamp of the last activity.
+    ['Trigger Count', ''],                                                  // Label for the number of active triggers.
+    ['Total Threads Found', ''],                                            // Label for the total number of email threads found in the inbox.
+    ['Total Threads Processed', 0],                                         // Label for the number of threads processed so far.
+    ['Estimated Progress', '=IF(B6=0, 0, B7/B6)'],                          // Use a formula for automatic progress calculation.
+    ['Total Emails Found', 0],                                              // Label for the total number of individual emails found.
+    ['Unique Senders Found', 0],                                            // Label for the number of unique senders found.
+    ['Current Phase', ''],                                                  // Label for a descriptive message about the current operation.
+    [],                                                                     // Spacer row.
+    ['--- Progress State ---', ''],                                         // Sub-header for progress state.
+    ['Page Token', 'START'],                                                // Label and initial value for the page token.
+    ['Batch JSON', ''], ['Batch Pos', 0]                                    // Labels and initial values for batch data.
   ]);                                                                       // End of status sheet values.
   statusSheet.getRange('B8').setNumberFormat('0.00%');                      // Format the formula cell as a percentage.
   statusSheet.getRange('A1:A').setFontWeight('bold');                       // Make the first column of the status sheet bold for readability.
@@ -398,32 +403,43 @@ function prepareCrawlerSheets(fresh = false) {                              // F
 }                                                                           // End of prepareCrawlerSheets function.
 
 /**
- * @summary Persist crawler progress into the "Crawler Progress" sheet.
+ * @summary Persist crawler progress into the "Crawler Status" sheet.
  */
 function saveProgress(pageToken, threadsProcessed, currentBatch, batchPosition) { // Function definition to save progress.
   const ss = SpreadsheetApp.getActiveSpreadsheet();                             // Get the active spreadsheet.
-  const ps = ss.getSheetByName('Crawler Progress');                             // Get the progress sheet.
-  if (!ps) return;                                                              // If the sheet doesn't exist, do nothing.
+  const statusSheet = ss.getSheetByName('Crawler Status');                      // Get the status sheet.
+  if (!statusSheet) return;                                                     // If the sheet doesn't exist, do nothing.
   const json = (Array.isArray(currentBatch) && currentBatch.length) ? JSON.stringify(currentBatch) : ''; // Convert the current batch array to a JSON string.
-  ps.getRange('A2:D2').setValues([[pageToken || '', threadsProcessed || 0, json, batchPosition || 0]]); // Write all the progress data to the sheet in one go.
+  statusSheet.getRange('B14').setValue(pageToken || '');                        // Write the page token to cell B14.
+  statusSheet.getRange('B7').setValue(threadsProcessed || 0);                   // Write the processed count to cell B7.
+  statusSheet.getRange('B15').setValue(json);                                   // Write the batch JSON to cell B15.
+  statusSheet.getRange('B16').setValue(batchPosition || 0);                     // Write the batch position to cell B16.
 }                                                                               // End of saveProgress function.
 
 /**
- * @summary Read and normalize the saved progress from the "Crawler Progress" sheet.
+ * @summary Read and normalize the saved progress from the "Crawler Status" sheet.
  */
 function loadCrawlerProgress() {                                                // Function definition to load progress.
   const ss = SpreadsheetApp.getActiveSpreadsheet();                             // Get the active spreadsheet.
-  const ps = ss.getSheetByName('Crawler Progress');                             // Get the progress sheet.
-  if (!ps || ps.getLastRow() < 2) return { pageToken: 'START', threadsProcessed: 0, currentBatch: [], batchPosition: 0 }; // If no progress is saved, return a 'START' state.
-  const row = ps.getRange('A2:D2').getValues()[0];                              // Read the progress data row.
-  const pageToken = row[0] == null ? '' : String(row[0]);                       // Get the page token, ensuring it's a string.
-  const threadsProcessed = parseInt(row[1], 10) || 0;                           // Get the processed count, ensuring it's an integer.
+  const statusSheet = ss.getSheetByName('Crawler Status');                      // Get the status sheet.
+  if (!statusSheet || statusSheet.getLastRow() < 14) return { pageToken: 'START', threadsProcessed: 0, currentBatch: [], batchPosition: 0 }; // If no progress is saved, return a 'START' state.
+  
+  const pageToken = statusSheet.getRange('B14').getValue();                     // Read the page token from cell B14.
+  const threadsProcessed = statusSheet.getRange('B7').getValue();               // Read the processed count from cell B7.
+  const batchJson = statusSheet.getRange('B15').getValue();                     // Read the batch JSON from cell B15.
+  const batchPosition = statusSheet.getRange('B16').getValue();                 // Read the batch position from cell B16.
+
   let currentBatch = [];                                                        // Initialize an empty array for the batch.
   try {                                                                         // Start a try block for safe JSON parsing.
-    currentBatch = row[2] ? JSON.parse(row[2]) : [];                            // Parse the JSON string back into an array.
+    currentBatch = batchJson ? JSON.parse(batchJson) : [];                      // Parse the JSON string back into an array.
   } catch (e) { currentBatch = []; }                                            // If parsing fails, use an empty array.
-  const batchPosition = parseInt(row[3], 10) || 0;                              // Get the batch position, ensuring it's an integer.
-  return { pageToken, threadsProcessed, currentBatch, batchPosition };          // Return the loaded progress as an object.
+  
+  return {                                                                      // Return the loaded progress as an object.
+    pageToken: pageToken == null ? '' : String(pageToken),                      // Ensure page token is a string.
+    threadsProcessed: parseInt(threadsProcessed, 10) || 0,                      // Ensure processed count is an integer.
+    currentBatch: currentBatch,                                                 // The parsed batch array.
+    batchPosition: parseInt(batchPosition, 10) || 0                             // Ensure batch position is an integer.
+  };                                                                            // End of return object.
 }                                                                               // End of loadCrawlerProgress function.
 
 /**
