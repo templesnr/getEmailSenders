@@ -5,7 +5,7 @@
  * until the entire Gmail account has been processed. Tracks senders, name variations,
  * totals, progress %, trigger count, and preserves progress across runs.
  *
- * Version 12.2: Restored missing global constant.
+ * Version 13: Added tracking for both Thread Count and Email Count.
  */
 
 // --------------------------- Globals --------------------------- //
@@ -216,15 +216,18 @@ function completeCrawlerAnalysis() {                                            
 
 // --------------------------- Core Logic Functions --------------------------- //
 /**
- * @summary Processes a single email thread to extract sender information.
- * @description This function takes a thread object (fetched from the API), iterates through
- * its messages, parses the sender, and updates the in-memory maps. It contains no API calls.
+ * @summary Processes a single email thread to extract sender information for thread and email counts.
+ * @description This function takes a thread object, identifies the unique senders within that
+ * thread, and correctly increments both the overall thread count (once per sender per thread)
+ * and the email count (for every message from that sender).
  * @param {object} thread - The full thread object from the Gmail API.
  * @param {Map} sendersMap - The in-memory map of sender data to be updated.
  * @param {Map} nameVarMap - The in-memory map of name variations to be updated.
  */
 function processThreadForCrawler(thread, sendersMap, nameVarMap) {              // Function definition to process one thread.
   const messages = thread.messages || [];                                       // Get the messages from the thread, or an empty array.
+  const sendersInThisThread = new Set();                                        // Create a temporary Set to track senders already counted for this thread.
+
   for (const msg of messages) {                                                 // Loop through each message in the thread.
     const headers = msg.payload && msg.payload.headers ? msg.payload.headers : []; // Get the headers for the message.
     const fromH = headers.find(h => h.name.toLowerCase() === 'from');           // Find the 'From' header.
@@ -240,14 +243,25 @@ function processThreadForCrawler(thread, sendersMap, nameVarMap) {              
 
     const entry = sendersMap.get(baseEmail);                                    // Check if the sender already exists in the map.
     if (!entry) {                                                               // If the sender is new...
-      sendersMap.set(baseEmail, { primaryName: parsed.name || baseEmail, email: baseEmail, date: messageDate, count: 1 }); // ...create a new entry.
+      sendersMap.set(baseEmail, {                                               // ...create a new entry.
+        primaryName: parsed.name || baseEmail,                                  // Set the primary name.
+        email: baseEmail,                                                       // Set the email.
+        date: messageDate,                                                      // Set the last seen date.
+        threadCount: 1,                                                         // Initialize thread count to 1.
+        emailCount: 1                                                           // Initialize email count to 1.
+      });                                                                       // End of new entry object.
     } else {                                                                    // If the sender exists...
-      entry.count++;                                                            // ...increment their email count.
+      entry.emailCount++;                                                       // ...always increment their email count.
+      if (!sendersInThisThread.has(baseEmail)) {                                // ...if this is the first time we see them in THIS thread...
+        entry.threadCount++;                                                    // ......then increment their thread count.
+      }                                                                         // End of thread count check.
       if (messageDate > entry.date) {                                           // ...if the new message is more recent...
         entry.date = messageDate;                                               // ......update the last seen date.
         entry.primaryName = parsed.name || entry.primaryName;                   // ......and update their primary name.
       }                                                                         // ...end of date check.
     }                                                                           // End of if/else block.
+    
+    sendersInThisThread.add(baseEmail);                                         // Add the sender to the set for this thread to prevent re-counting threads.
 
     if (!nameVarMap.has(baseEmail)) nameVarMap.set(baseEmail, new Set());       // Ensure a Set exists for this email in the name variations map.
     const nm = (parsed.name || '').trim();                                      // Get the name variant from this email.
@@ -356,11 +370,11 @@ function prepareCrawlerSheets(fresh = false) {                              // F
   if (!sendersSheet) sendersSheet = ss.insertSheet('Senders');              // If the sheet doesn't exist, create it.
   if (fresh) sendersSheet.clear();                                          // If it's a fresh start, clear the sheet.
   if (sendersSheet.getLastRow() < 1) {                                      // If the sheet is completely empty...
-    sendersSheet.getRange(1, 1, 1, 4).setValues([['Name', 'Email', 'Last Seen', 'Count']]); // ...add the header row.
+    sendersSheet.getRange(1, 1, 1, 5).setValues([['Name', 'Email', 'Last Seen', 'Thread Count', 'Email Count']]); // ...add the NEW 5-column header row.
   }                                                                         // End of if block.
   sendersSheet.setFrozenRows(1);                                            // Freeze the header row so it's always visible.
   if (!sendersSheet.getFilter()) {                                          // If there is no filter on the sheet...
-    try { sendersSheet.getRange(1, 1, sendersSheet.getMaxRows(), 4).createFilter(); } catch (e) {} // ...add one to allow sorting.
+    try { sendersSheet.getRange(1, 1, sendersSheet.getMaxRows(), 5).createFilter(); } catch (e) {} // ...add one to allow sorting.
   }                                                                         // End of if block.
 
   // ---------- Name Variations sheet ----------
@@ -420,12 +434,18 @@ function loadSendersMapFromSheet() {                                            
   try {                                                                         // Start a try block for sheet operations.
     const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Senders'); // Get the "Senders" sheet.
     if (!sheet || sheet.getLastRow() < 2) return map;                           // If the sheet is empty, return the empty map.
-    const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 4).getValues();   // Get all the data rows from the sheet.
+    const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 5).getValues();   // Get all the data rows from the sheet (now 5 columns).
     for (const r of rows) {                                                     // Loop through each row.
       const email = (r[1] || '').toString().toLowerCase();                      // Get and normalize the email from the second column.
       if (!email) continue;                                                     // If the email is blank, skip to the next row.
       const dateVal = r[2] ? new Date(r[2]) : new Date(0);                      // Get the date from the third column, converting it to a Date object.
-      map.set(email, { primaryName: r[0], email: email, date: dateVal, count: parseInt(r[3], 10) || 0 }); // Add the sender's data to the map.
+      map.set(email, {                                                          // Add the sender's data to the map.
+        primaryName: r[0],                                                      // The sender's name.
+        email: email,                                                           // The sender's email.
+        date: dateVal,                                                          // The last seen date.
+        threadCount: parseInt(r[3], 10) || 0,                                   // The thread count.
+        emailCount: parseInt(r[4], 10) || 0                                     // The email count.
+      });                                                                       // End of map set.
     }                                                                           // End of loop.
   } catch (e) { console.warn('load senders err', e); }                          // If an error occurs, log a warning.
   return map;                                                                   // Return the populated map.
@@ -458,18 +478,18 @@ function persistSendersMapToSheet(map) {                                        
     const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Senders'); // Get the "Senders" sheet.
     if (!sheet) return;                                                         // If the sheet doesn't exist, do nothing.
     const arr = Array.from(map.values()).sort((a, b) => (b.date || 0) - (a.date || 0)); // Convert the map values to an array and sort by date descending.
-    const rows = arr.map(s => [s.primaryName, s.email, s.date, s.count]);       // Convert the array of objects to a 2D array for writing to the sheet.
+    const rows = arr.map(s => [s.primaryName, s.email, s.date, s.threadCount, s.emailCount]); // Convert the array of objects to a 2D array for writing to the sheet.
 
     sheet.clearContents();                                                      // Clear all existing data from the sheet.
-    sheet.getRange(1, 1, 1, 4).setValues([['Name', 'Email', 'Last Seen', 'Count']]); // Write the header row.
+    sheet.getRange(1, 1, 1, 5).setValues([['Name', 'Email', 'Last Seen', 'Thread Count', 'Email Count']]); // Write the NEW 5-column header row.
     if (rows.length > 0) {                                                      // If there is data to write...
-        sheet.getRange(2, 1, rows.length, 4).setValues(rows);                   // ...write all the rows to the sheet.
+        sheet.getRange(2, 1, rows.length, 5).setValues(rows);                   // ...write all the rows to the sheet.
     }                                                                           // End of if block.
     sheet.setFrozenRows(1);                                                     // Freeze the header row.
     if (sheet.getFilter()) sheet.getFilter().remove();                          // Remove any existing filter to prevent errors.
-    sheet.getRange(1, 1, sheet.getMaxRows(), 4).createFilter();                 // Create a new filter on the data range.
+    sheet.getRange(1, 1, sheet.getMaxRows(), 5).createFilter();                 // Create a new filter on the data range.
     if (rows.length > 0) {                                                      // If there are rows...
-        sheet.getRange(2, 1, rows.length, 4).sort({ column: 3, ascending: false }); // ...sort the sheet by the "Last Seen" column (column 3).
+        sheet.getRange(2, 1, rows.length, 5).sort({ column: 3, ascending: false }); // ...sort the sheet by the "Last Seen" column (column 3).
     }                                                                           // End of if block.
   } catch (e) { console.warn('persist senders err', e); }                       // If an error occurs, log a warning.
 }                                                                               // End of persistSendersMapToSheet function.
@@ -501,7 +521,7 @@ function getTotalEmailsCount() {                                                
   try {                                                                         // Start a try block for sheet operations.
     const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Senders'); // Get the "Senders" sheet.
     if (!sheet || sheet.getLastRow() < 2) return 0;                             // If the sheet is empty, return 0.
-    const data = sheet.getRange(2, 4, sheet.getLastRow() - 1, 1).getValues();   // Get all values from the "Count" column (column 4).
+    const data = sheet.getRange(2, 5, sheet.getLastRow() - 1, 1).getValues();   // Get all values from the "Email Count" column (column 5).
     return data.reduce((sum, row) => sum + (parseInt(row[0], 10) || 0), 0);      // Use reduce to sum all the values in the column.
   } catch (e) { console.warn('get total emails err', e); return 0; }            // If an error occurs, log a warning and return 0.
 }                                                                               // End of getTotalEmailsCount function.
@@ -563,7 +583,7 @@ function moveKeepersToEnd() {                                                   
       return;                                                                   // ...stop the function.
     }                                                                           // End of if block.
 
-    const sendersData = sendersSheet.getRange(2, 1, sendersSheet.getLastRow() - 1, 4).getValues(); // Get all data from the Senders sheet.
+    const sendersData = sendersSheet.getRange(2, 1, sendersSheet.getLastRow() - 1, 5).getValues(); // Get all data from the Senders sheet (now 5 columns).
     const keepersData = keepersSheet.getRange(1, 1, keepersSheet.getLastRow(), 1).getValues(); // Get the list of keeper emails.
     const keepersMap = new Map(keepersData.map((row, i) => [row[0].toLowerCase().trim(), i + 1])); // Create a map of keeper emails to their row number.
 
@@ -584,15 +604,15 @@ function moveKeepersToEnd() {                                                   
       console.info(`Updating ${keepersToUpdate.length} sender(s) in the Keepers sheet.`); // ...log how many are being updated.
 
       for (const keeper of keepersToUpdate) {                                   // Loop through each keeper to be updated.
-        keepersSheet.getRange(keeper.row, 1, 1, 4).setValues([keeper.data]);    // Write the full 4-column sender data to the correct row in the Keepers sheet.
+        keepersSheet.getRange(keeper.row, 1, 1, 5).setValues([keeper.data]);    // Write the full 5-column sender data to the correct row in the Keepers sheet.
       }                                                                         // End of loop.
       
-      keepersSheet.getRange(1, 1, 1, 4).setValues([['Name', 'Email', 'Last Seen', 'Count']]); // Set the 4-column header.
+      keepersSheet.getRange(1, 1, 1, 5).setValues([['Name', 'Email', 'Last Seen', 'Thread Count', 'Email Count']]); // Set the 5-column header.
 
       sendersSheet.clearContents();                                             // Clear the entire Senders sheet.
-      sendersSheet.getRange(1, 1, 1, 4).setValues([['Name', 'Email', 'Last Seen', 'Count']]); // Write the header back to the Senders sheet.
+      sendersSheet.getRange(1, 1, 1, 5).setValues([['Name', 'Email', 'Last Seen', 'Thread Count', 'Email Count']]); // Write the header back to the Senders sheet.
       if (rowsToKeepInSenders.length > 0) {                                     // If there are any senders left...
-        sendersSheet.getRange(2, 1, rowsToKeepInSenders.length, 4).setValues(rowsToKeepInSenders); // ...write them back to the Senders sheet.
+        sendersSheet.getRange(2, 1, rowsToKeepInSenders.length, 5).setValues(rowsToKeepInSenders); // ...write them back to the Senders sheet.
       }                                                                         // End of if block.
 
     } else {                                                                    // If no matching keepers were found...
