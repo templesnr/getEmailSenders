@@ -5,11 +5,35 @@
  * until the entire Gmail account has been processed. Tracks senders, name variations,
  * totals, progress %, trigger count, and preserves progress across runs.
  *
- * Version 14.1: Corrected range error during sheet preparation.
+ * Version 15: Refactored Status sheet layout to be configuration-based for easy reordering.
  */
 
 // --------------------------- Globals --------------------------- //
 const CRAWLER_RUN_MS = 4.5 * 60 * 1000;                                      // Define the maximum runtime for a single session (4.5 minutes in milliseconds).
+
+/**
+ * @summary Configuration object for the "Crawler Status" sheet layout.
+ * @description To reorder the rows on the sheet, simply change the 'row' numbers below.
+ * The script will automatically adjust where it reads from and writes to.
+ */
+const STATUS_CONFIG = {
+  TITLE:                  { label: 'Crawler Status',         row: 1 },
+  STATUS:                 { label: 'Status',                  row: 2 },
+  STARTED:                { label: 'Started',                 row: 3 },
+  LAST_UPDATE:            { label: 'Last Update',             row: 4 },
+  TRIGGER_COUNT:          { label: 'Trigger Count',           row: 5 },
+  TOTAL_THREADS_FOUND:    { label: 'Total Threads Found',     row: 6 },
+  THREADS_PROCESSED:      { label: 'Total Threads Processed',  row: 7 },
+  ESTIMATED_PROGRESS:     { label: 'Estimated Progress',      row: 8 },
+  TOTAL_EMAILS_FOUND:     { label: 'Total Emails Found',      row: 9 },
+  UNIQUE_SENDERS_FOUND:   { label: 'Unique Senders Found',    row: 10 },
+  CURRENT_PHASE:          { label: 'Current Phase',           row: 11 },
+  SPACER:                 { label: '--- Progress State ---',  row: 13 },
+  PAGE_TOKEN:             { label: 'Page Token',              row: 14 },
+  BATCH_JSON:             { label: 'Batch JSON',              row: 15 },
+  BATCH_POS:              { label: 'Batch Pos',               row: 16 }
+};
+
 
 // --------------------------- UI & Menu Functions --------------------------- //
 /**
@@ -291,7 +315,7 @@ function countAllGmailThreadsFast() {                                       // F
   console.info('Total Gmail threads found:', totalThreads);                 // Log the final total.
   const ss = SpreadsheetApp.getActiveSpreadsheet();                         // Get the active spreadsheet.
   const statusSheet = ss.getSheetByName('Crawler Status');                  // Get the status sheet.
-  statusSheet.getRange('B6').setValue(totalThreads);                        // Write the final total to the status sheet.
+  statusSheet.getRange(STATUS_CONFIG.TOTAL_THREADS_FOUND.row, 2).setValue(totalThreads); // Write the total to the correct row using the config.
   return totalThreads;                                                      // Return the total count.
 }                                                                           // End of countAllGmailThreadsFast function.
 
@@ -350,25 +374,27 @@ function prepareCrawlerSheets(fresh = false) {                              // F
   let statusSheet = ss.getSheetByName('Crawler Status');                    // Get the sheet named "Crawler Status".
   if (!statusSheet) statusSheet = ss.insertSheet('Crawler Status');         // If the sheet doesn't exist, create it.
   statusSheet.clear();                                                      // Clear all content from the status sheet.
-  statusSheet.getRange('A1:B16').setValues([                                // Set up the layout and labels for the status dashboard.
-    ['Crawler Status', ''],                                                 // 1
-    ['Status', ''],                                                         // 2
-    ['Started', ''],                                                        // 3
-    ['Last Update', ''],                                                    // 4
-    ['Trigger Count', ''],                                                  // 5
-    ['Total Threads Found', ''],                                            // 6
-    ['Total Threads Processed', 0],                                         // 7
-    ['Estimated Progress', '=IF(B6=0, 0, B7/B6)'],                          // 8
-    ['Total Emails Found', 0],                                              // 9
-    ['Unique Senders Found', 0],                                            // 10
-    ['Current Phase', ''],                                                  // 11
-    [],                                                                     // 12 (Spacer row)
-    ['--- Progress State ---', ''],                                         // 13 (Sub-header)
-    ['Page Token', 'START'],                                                // 14
-    ['Batch JSON', ''],                                                     // 15
-    ['Batch Pos', 0]                                                        // 16
-  ]);                                                                       // End of status sheet values.
-  statusSheet.getRange('B8').setNumberFormat('0.00%');                      // Format the formula cell as a percentage.
+  
+  // Build the initial layout from the configuration object
+  const statusLayout = [];                                                  // Initialize an empty array for the layout.
+  const maxRow = Math.max(...Object.values(STATUS_CONFIG).map(item => item.row)); // Find the highest row number in the config.
+  for (let i = 0; i < maxRow; i++) statusLayout.push(['', '']);              // Create an empty 2D array of the correct size.
+
+  for (const key in STATUS_CONFIG) {                                        // Loop through each key in the config object.
+    const item = STATUS_CONFIG[key];                                        // Get the item (label and row number).
+    statusLayout[item.row - 1][0] = item.label;                             // Set the label in the first column of the correct row.
+  }                                                                         // End of loop.
+  
+  // Set initial values
+  statusLayout[STATUS_CONFIG.THREADS_PROCESSED.row - 1][1] = 0;             // Set initial processed threads to 0.
+  statusLayout[STATUS_CONFIG.ESTIMATED_PROGRESS.row - 1][1] = `=IF(B${STATUS_CONFIG.TOTAL_THREADS_FOUND.row}=0, 0, B${STATUS_CONFIG.THREADS_PROCESSED.row}/B${STATUS_CONFIG.TOTAL_THREADS_FOUND.row})`; // Set the progress formula.
+  statusLayout[STATUS_CONFIG.TOTAL_EMAILS_FOUND.row - 1][1] = 0;            // Set initial emails found to 0.
+  statusLayout[STATUS_CONFIG.UNIQUE_SENDERS_FOUND.row - 1][1] = 0;          // Set initial unique senders to 0.
+  statusLayout[STATUS_CONFIG.PAGE_TOKEN.row - 1][1] = 'START';              // Set initial page token to 'START'.
+  statusLayout[STATUS_CONFIG.BATCH_POS.row - 1][1] = 0;                     // Set initial batch position to 0.
+
+  statusSheet.getRange(1, 1, statusLayout.length, 2).setValues(statusLayout); // Write the entire layout to the sheet.
+  statusSheet.getRange(STATUS_CONFIG.ESTIMATED_PROGRESS.row, 2).setNumberFormat('0.00%'); // Format the formula cell as a percentage.
   statusSheet.getRange('A1:A').setFontWeight('bold');                       // Make the first column of the status sheet bold for readability.
 
   // ---------- Senders sheet ----------
@@ -411,10 +437,10 @@ function saveProgress(pageToken, threadsProcessed, currentBatch, batchPosition) 
   const statusSheet = ss.getSheetByName('Crawler Status');                      // Get the status sheet.
   if (!statusSheet) return;                                                     // If the sheet doesn't exist, do nothing.
   const json = (Array.isArray(currentBatch) && currentBatch.length) ? JSON.stringify(currentBatch) : ''; // Convert the current batch array to a JSON string.
-  statusSheet.getRange('B14').setValue(pageToken || '');                        // Write the page token to cell B14.
-  statusSheet.getRange('B7').setValue(threadsProcessed || 0);                   // Write the processed count to cell B7.
-  statusSheet.getRange('B15').setValue(json);                                   // Write the batch JSON to cell B15.
-  statusSheet.getRange('B16').setValue(batchPosition || 0);                     // Write the batch position to cell B16.
+  statusSheet.getRange(STATUS_CONFIG.PAGE_TOKEN.row, 2).setValue(pageToken || ''); // Write the page token to its configured row.
+  statusSheet.getRange(STATUS_CONFIG.THREADS_PROCESSED.row, 2).setValue(threadsProcessed || 0); // Write the processed count to its configured row.
+  statusSheet.getRange(STATUS_CONFIG.BATCH_JSON.row, 2).setValue(json);         // Write the batch JSON to its configured row.
+  statusSheet.getRange(STATUS_CONFIG.BATCH_POS.row, 2).setValue(batchPosition || 0); // Write the batch position to its configured row.
 }                                                                               // End of saveProgress function.
 
 /**
@@ -423,12 +449,12 @@ function saveProgress(pageToken, threadsProcessed, currentBatch, batchPosition) 
 function loadCrawlerProgress() {                                                // Function definition to load progress.
   const ss = SpreadsheetApp.getActiveSpreadsheet();                             // Get the active spreadsheet.
   const statusSheet = ss.getSheetByName('Crawler Status');                      // Get the status sheet.
-  if (!statusSheet || statusSheet.getLastRow() < 14) return { pageToken: 'START', threadsProcessed: 0, currentBatch: [], batchPosition: 0 }; // If no progress is saved, return a 'START' state.
+  if (!statusSheet || statusSheet.getLastRow() < STATUS_CONFIG.BATCH_POS.row) return { pageToken: 'START', threadsProcessed: 0, currentBatch: [], batchPosition: 0 }; // If no progress is saved, return a 'START' state.
   
-  const pageToken = statusSheet.getRange('B14').getValue();                     // Read the page token from cell B14.
-  const threadsProcessed = statusSheet.getRange('B7').getValue();               // Read the processed count from cell B7.
-  const batchJson = statusSheet.getRange('B15').getValue();                     // Read the batch JSON from cell B15.
-  const batchPosition = statusSheet.getRange('B16').getValue();                 // Read the batch position from cell B16.
+  const pageToken = statusSheet.getRange(STATUS_CONFIG.PAGE_TOKEN.row, 2).getValue(); // Read the page token from its configured row.
+  const threadsProcessed = statusSheet.getRange(STATUS_CONFIG.THREADS_PROCESSED.row, 2).getValue(); // Read the processed count from its configured row.
+  const batchJson = statusSheet.getRange(STATUS_CONFIG.BATCH_JSON.row, 2).getValue(); // Read the batch JSON from its configured row.
+  const batchPosition = statusSheet.getRange(STATUS_CONFIG.BATCH_POS.row, 2).getValue(); // Read the batch position from its configured row.
 
   let currentBatch = [];                                                        // Initialize an empty array for the batch.
   try {                                                                         // Start a try block for safe JSON parsing.
@@ -560,10 +586,10 @@ function updateCrawlerProgress(threadsProcessed, emailsFound, sendersCount) {   
   try {                                                                         // Start a try block for sheet operations.
     const s = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Crawler Status'); // Get the "Crawler Status" sheet.
     if (!s) return;                                                             // If the sheet doesn't exist, do nothing.
-    s.getRange('B4').setValue(new Date());                                      // Update the "Last Update" timestamp.
-    if (threadsProcessed != null) s.getRange('B7').setValue(threadsProcessed);  // Update the "Total Threads Processed" count.
-    if (emailsFound != null) s.getRange('B9').setValue(emailsFound);            // Update the "Total Emails Found" count.
-    if (sendersCount != null) s.getRange('B10').setValue(sendersCount);         // Update the "Unique Senders Found" count.
+    s.getRange(STATUS_CONFIG.LAST_UPDATE.row, 2).setValue(new Date());          // Update the "Last Update" timestamp.
+    if (threadsProcessed != null) s.getRange(STATUS_CONFIG.THREADS_PROCESSED.row, 2).setValue(threadsProcessed);  // Update the "Total Threads Processed" count.
+    if (emailsFound != null) s.getRange(STATUS_CONFIG.TOTAL_EMAILS_FOUND.row, 2).setValue(emailsFound);            // Update the "Total Emails Found" count.
+    if (sendersCount != null) s.getRange(STATUS_CONFIG.UNIQUE_SENDERS_FOUND.row, 2).setValue(sendersCount);         // Update the "Unique Senders Found" count.
     PropertiesService.getScriptProperties().setProperty('totalThreadsProcessed', String(threadsProcessed || 0)); // Save the thread count to script properties for persistence.
   } catch (e) { console.warn('update progress err', e); }                       // If an error occurs, log a warning.
 }                                                                               // End of updateCrawlerProgress function.
@@ -576,13 +602,13 @@ function updateCrawlerStatus(status, message) {                                 
   const statusSheet = ss.getSheetByName('Crawler Status');                      // Get the "Crawler Status" sheet.
   if (!statusSheet) return;                                                     // If the sheet doesn't exist, do nothing.
   const now = new Date();                                                       // Get the current time.
-  statusSheet.getRange('B2').setValue(status);                                  // Set the main status message.
-  const startedVal = statusSheet.getRange('B3').getValue();                     // Get the value of the "Started" cell.
+  statusSheet.getRange(STATUS_CONFIG.STATUS.row, 2).setValue(status);           // Set the main status message.
+  const startedVal = statusSheet.getRange(STATUS_CONFIG.STARTED.row, 2).getValue(); // Get the value of the "Started" cell.
   if (!startedVal && (status === 'INITIALIZING' || status === 'INITIALIZED')) { // If the "Started" cell is empty and the status is initializing...
-    statusSheet.getRange('B3').setValue(now);                                   // ...set the "Started" timestamp.
+    statusSheet.getRange(STATUS_CONFIG.STARTED.row, 2).setValue(now);           // ...set the "Started" timestamp.
   }                                                                             // End of if block.
-  statusSheet.getRange('B4').setValue(now);                                     // Set the "Last Update" timestamp.
-  if (message) statusSheet.getRange('B11').setValue(message);                   // If a descriptive message was provided, set it.
+  statusSheet.getRange(STATUS_CONFIG.LAST_UPDATE.row, 2).setValue(now);         // Set the "Last Update" timestamp.
+  if (message) statusSheet.getRange(STATUS_CONFIG.CURRENT_PHASE.row, 2).setValue(message); // If a descriptive message was provided, set it.
   console.info('Status updated:', status, '-', message || '');                  // Log the status update.
 }                                                                               // End of updateCrawlerStatus function.
 
@@ -679,7 +705,7 @@ function updateTriggerCountInStatus() {                                         
     const triggers = ScriptApp.getProjectTriggers();                            // Get all triggers for this script project.
     const count = triggers.filter(t => ['runCrawlerSession', 'countThreadsAndStart'].includes(t.getHandlerFunction())).length; // Count how many triggers match the crawler's function names.
     const statusSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Crawler Status'); // Get the "Crawler Status" sheet.
-    if (statusSheet) statusSheet.getRange('B5').setValue(count);                // If the sheet exists, write the count to it.
+    if (statusSheet) statusSheet.getRange(STATUS_CONFIG.TRIGGER_COUNT.row, 2).setValue(count); // If the sheet exists, write the count to it.
   } catch (e) { console.warn('update trigger count err', e); }                  // If an error occurs, log a warning.
 }                                                                               // End of updateTriggerCountInStatus function.
 
@@ -709,7 +735,7 @@ function timeLimitReached(startTime) {                                          
 function checkCrawlerStatus() {                                                 // Function definition for the debug helper.
   try {                                                                         // Start a try block for sheet operations.
     const s = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Crawler Status'); // Get the "Crawler Status" sheet.
-    const status = s ? s.getRange('B2').getValue() : 'NOT FOUND';               // Get the value from the status cell.
+    const status = s ? s.getRange(STATUS_CONFIG.STATUS.row, 2).getValue() : 'NOT FOUND'; // Get the value from the status cell.
     console.info('Crawler status:', status);                                    // Log the current status.
   } catch (e) { console.warn('check status err', e); }                          // If an error occurs, log a warning.
 }                                                                               // End of checkCrawlerStatus function.
